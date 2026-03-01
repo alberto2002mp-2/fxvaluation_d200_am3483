@@ -26,10 +26,21 @@ This project applies advanced machine learning techniques to predict short-term 
 Follow these steps to set up the project on your machine:
 
 #### 1. Clone the Repository
+You can clone the repository using your preferred protocol. Examples:
+
+**HTTPS:**
 ```bash
-git clone <repository-url>
+git clone https://github.com/alberto2002mp-2/fxvaluation_d200_am3483.git
 cd fxvaluation_d200_am3483
 ```
+
+**GitHub CLI:**
+```bash
+gh repo clone alberto2002mp-2/fxvaluation_d200_am3483
+cd fxvaluation_d200_am3483
+```
+
+Replace the URL with the one appropriate for your account if you forked the repo.
 
 #### 2. Run the Setup Script (Windows)
 Execute the PowerShell setup script to automatically create a virtual environment and install dependencies:
@@ -137,41 +148,6 @@ deactivate
 
 ---
 
-## Working with the Project
-
-### Adding New Dependencies
-If you need to install additional packages:
-
-1. Activate the virtual environment
-2. Install the package: `pip install package-name`
-3. Update requirements.txt: `pip freeze > requirements.txt`
-4. Commit the updated `requirements.txt` to version control
-
-### Creating New Notebooks
-1. Create files in the `notebooks/` directory with descriptive names (e.g., `03_Feature_Engineering.ipynb`)
-2. Number them in execution order for clarity
-
-### Adding Python Modules
-1. Create `.py` files in the `src/` directory
-2. Import and use them in your notebooks as:
-   ```python
-   from src.data import load_data
-   from src.models import train_model
-   ```
-
----
-
-## Best Practices
-
-✓ **Always work within the virtual environment** to maintain isolation  
-✓ **Keep raw data in `data/raw/`** and never modify it  
-✓ **Document your analysis** in notebook markdown cells  
-✓ **Use consistent naming conventions** for variables and functions  
-✓ **Commit `requirements.txt` changes** when dependencies change  
-✓ **Add meaningful commit messages** for reproducibility  
-
----
-
 ## Troubleshooting
 
 ### Issue: "Python is not recognized"
@@ -194,26 +170,12 @@ python -m ipykernel install --user --name venv --display-name "Python (venv)"
 
 ---
 
-## Contributing
 
-When collaborating on this project:
-
-1. Create a new branch for your feature: `git checkout -b feature-name`
-2. Make your changes and commit with clear messages
-3. Push to the repository: `git push origin feature-name`
-4. Create a Pull Request describing your changes
-
----
 
 ## License
 
 This project is licensed under the terms specified in the [LICENSE](LICENSE) file.
 
----
-
-## Contact & Support
-
-For questions or issues, please refer to the project documentation or contact the project maintainers.
 
 ---
 
