@@ -10,17 +10,27 @@ This module exposes a helper to load every sheet into a dictionary of
 :class:`pandas.DataFrame` objects as well as module-level variables such as
 ``fx_df`` and ``usd_df`` for convenience.
 
-The code assumes ``pandas`` is installed (listed in ``requirements.txt``) and
-uses relative paths so it can be executed identically on any machine.
+Paths are resolved via a centralized config module to ensure consistent behavior
+across different execution environments (scripts, notebooks, etc.).
 """
 
 from __future__ import annotations
 
 import pathlib
+import sys
 import warnings
 from typing import Dict
 
 import pandas as pd
+
+# Ensure project root is on sys.path so we can import config
+# __file__ is src/data/load_excel_sheets.py
+# parents[0] = src/data, parents[1] = src, parents[2] = project_root
+_proj_root = pathlib.Path(__file__).resolve().parents[2]
+if str(_proj_root) not in sys.path:
+    sys.path.insert(0, str(_proj_root))
+
+from config import RAW_EXCEL_PATH
 
 
 def _parse_sheet(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
@@ -96,44 +106,45 @@ def _parse_sheet(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
 
 
 def load_all_sheets(
-    excel_path: str | pathlib.Path = "data/rawdata.xlsx",
+    excel_path: str | pathlib.Path | None = None,
 ) -> Dict[str, pd.DataFrame]:
     """Load every sheet from the provided Excel file except for "Summary".
 
     Parameters
     ----------
-    excel_path : str or pathlib.Path, optional
-        Path to the workbook.  Defaults to ``data/rawdata.xlsx`` relative to the
-        current working directory.  Historically the raw workbook lived under a
-        top-level ``data/`` folder, but some users prefer ``raw_data/`` to
-        avoid confusion with the package namespace.  If the given path does not
-        exist we also attempt the same filename inside ``raw_data/`` before
-        raising ``FileNotFoundError``.
-    """
-    """Load every sheet from the provided Excel file except for "Summary".
-
-    Parameters
-    ----------
-    excel_path : str or pathlib.Path, optional
-        Path to the workbook.  Defaults to ``data/rawdata.xlsx`` relative to the
-        current working directory.
+    excel_path : str, pathlib.Path, or None, optional
+        Path to the workbook. If None (default), uses RAW_EXCEL_PATH from config.
+        Can be either absolute or relative path.
 
     Returns
     -------
     dict[str, pd.DataFrame]
         Mapping from sheet name to the assembled DataFrame for that sheet.
-    """
-    excel_path = pathlib.Path(excel_path)
-    if not excel_path.exists():
-        # try the alternate raw_data directory if the default path was used
-        alt = excel_path.parent.parent / "raw_data" / excel_path.name
-        if alt.exists():
-            excel_path = alt
-        else:
-            raise FileNotFoundError(f"Excel file not found at {excel_path}")
 
-    # read all sheets without inferring headers so the first row is row 0
-    all_sheets = pd.read_excel(excel_path, sheet_name=None, header=None)
+    Raises
+    ------
+    FileNotFoundError
+        If the specified Excel file does not exist.
+    """
+    # Use config-defined path if none provided
+    if excel_path is None:
+        excel_path = RAW_EXCEL_PATH
+    else:
+        excel_path = pathlib.Path(excel_path)
+
+    excel_path = pathlib.Path(excel_path).resolve()
+
+    if not excel_path.exists():
+        raise FileNotFoundError(
+            f"Excel file not found at: {excel_path}\n"
+            f"Absolute path: {excel_path.absolute()}\n"
+            f"File exists: {excel_path.exists()}"
+        )
+
+    # read all sheets without inferring headers; use openpyxl engine for compatibility
+    all_sheets = pd.read_excel(
+        excel_path, sheet_name=None, header=None, engine="openpyxl"
+    )
     results: dict[str, pd.DataFrame] = {}
 
     for name, raw in all_sheets.items():
