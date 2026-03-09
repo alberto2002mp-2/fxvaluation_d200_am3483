@@ -246,7 +246,7 @@ _TRANSFORM_DAILY_PREFIXES = ("RR2YH",)
 
 def _log_return(series: pd.Series) -> pd.Series:
     """Compute log returns, preserving index."""
-    return np.log(series).diff()
+    return 100*(np.log(series).diff())
 
 
 def _daily_change(series: pd.Series) -> pd.Series:
