@@ -3,7 +3,7 @@
 This module is import-friendly for notebooks. Importing it will:
 1) Load all raw Excel sheets into `frames` (keyed as "<sheet>_df").
 2) Apply light column cleanup to select base frames.
-3) Build derived frames such as `sek_df2`, and `df2_map`.
+3) Build derived frames such as `sek_df2`, `df2_map`, and `processed_df_map`.
 
 If you want to re-run with a different Excel path, call `build_all(...)`.
 """
@@ -225,19 +225,391 @@ def build_df2_map(frames: Dict[str, pd.DataFrame], fx_newdf: pd.DataFrame) -> Di
     return df2_map
 
 
-def build_all(excel_path: str | pathlib.Path | None = None):
-    """Build and return (frames, fx_newdf, df2_map)."""
+def build_all(excel_path: str | pathlib.Path | None = None, return_processed: bool = False):
+    """Build and return (frames, fx_newdf, df2_map[, processed_df_map])."""
     frames = _apply_base_drops(load_frames(excel_path))
     fx_newdf = build_fx_newdf(frames["fx_df"])
     df2_map = build_df2_map(frames, fx_newdf)
+    if return_processed:
+        processed_df_map = build_processed_df_map(df2_map)
+        return frames, fx_newdf, df2_map, processed_df_map
     return frames, fx_newdf, df2_map
+
+
+# ---------------------------------------------------------------------------
+# Processing helpers
+# ---------------------------------------------------------------------------
+
+_TRANSFORM_DAILY_SUFFIXES = ("BLC Curncy", "BLC2 Curncy", "YR Index", "YR Corp")
+_TRANSFORM_DAILY_PREFIXES = ("RR2YH",)
+
+
+def _log_return(series: pd.Series) -> pd.Series:
+    """Compute log returns, preserving index."""
+    return np.log(series).diff()
+
+
+def _daily_change(series: pd.Series) -> pd.Series:
+    """Compute daily value change, preserving index."""
+    return series.diff()
+
+
+def _transform_series(series: pd.Series, col_name: str) -> pd.Series:
+    """Apply the correct transformation to a series based on its name."""
+    if col_name.endswith(_TRANSFORM_DAILY_SUFFIXES) or col_name.startswith(_TRANSFORM_DAILY_PREFIXES):
+        return _daily_change(series)
+    return _log_return(series)
+
+
+def _build_driver(df: pd.DataFrame, spec: dict, cache: dict[str, pd.Series]) -> pd.Series | None:
+    """Build a driver series from a DataFrame and a driver spec."""
+    def _get(col: str) -> pd.Series | None:
+        if col not in df.columns:
+            return None
+        if col not in cache:
+            cache[col] = _transform_series(df[col], col)
+        return cache[col]
+
+    if spec["type"] == "single":
+        return _get(spec["col"])
+    if spec["type"] == "spread":
+        left = _get(spec["left"])
+        right = _get(spec["right"])
+        if left is None or right is None:
+            return None
+        return left - right
+    raise ValueError(f"Unknown driver spec type: {spec['type']}")
+
+
+def process_dataframe(df: pd.DataFrame, driver_specs: dict[str, dict]) -> pd.DataFrame:
+    """Process a DataFrame according to driver_specs."""
+    if df.empty:
+        return pd.DataFrame(index=df.index)
+
+    df_ffill = df.ffill()
+    cache: dict[str, pd.Series] = {}
+    out: dict[str, pd.Series] = {}
+
+    for driver, spec in driver_specs.items():
+        series = _build_driver(df_ffill, spec, cache)
+        if series is not None:
+            out[driver] = series
+
+    if not out:
+        return pd.DataFrame(index=df_ffill.index)
+
+    result = pd.DataFrame(out, index=df_ffill.index)
+    return result.iloc[1:]
+
+
+# ---------------------------------------------------------------------------
+# Driver specification dictionaries
+# ---------------------------------------------------------------------------
+
+DRIVER_SPECS_MAP = {
+    "eur_df2": {
+        "EURUSD": {"type": "single", "col": "EURUSD Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY_ex_EUR"},
+        "EMFX": {"type": "single", "col": "EMFXDBET Index"},
+        "2y yield": {"type": "spread", "left": "GECU2YR Index", "right": "USGG2YR Index"},
+        "5y yield": {"type": "spread", "left": "GECU5YR Index", "right": "USGG5YR Index"},
+        "10y yield": {"type": "spread", "left": "GECU10YR Index", "right": "USGG10YR Index"},
+        "3m1m forward OIS": {"type": "spread", "left": "G0013 3M1M BLC2 Curncy", "right": "S0042FS 3M1M BLC Curncy"},
+        "6m1m forward OIS": {"type": "spread", "left": "G0013 6M1M BLC2 Curncy", "right": "S0042FS 6M1M BLC Curncy"},
+        "1y1m forward OIS": {"type": "spread", "left": "G0013 1Y1M BLC2 Curncy", "right": "S0042FS 1Y1M BLC Curncy"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHEA Index", "right": "RR2YHUS Index"},
+        "Local - S&P500": {"type": "spread", "left": "SXXP Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "SXXP Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "SXXP Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "SXXP Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+    },
+    "gbp_df2": {
+        "GBPUSD": {"type": "single", "col": "GBPUSD Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY_ex_GBP"},
+        "EMFX": {"type": "single", "col": "EMFXDBET Index"},
+        "2y yield": {"type": "spread", "left": "GTGBP2YR Corp", "right": "USGG2YR Index"},
+        "5y yield": {"type": "spread", "left": "GTGBP5YR Corp", "right": "USGG5YR Index"},
+        "10y yield": {"type": "spread", "left": "GTGBP10YR Corp", "right": "USGG10YR Index"},
+        "3m1m forward OIS": {"type": "spread", "left": "G0022 3M1M BLC2 Curncy", "right": "S0042FS 3M1M BLC Curncy"},
+        "6m1m forward OIS": {"type": "spread", "left": "G0022 6M1M BLC2 Curncy", "right": "S0042FS 6M1M BLC Curncy"},
+        "1y1m forward OIS": {"type": "spread", "left": "G0022 1Y1M BLC2 Curncy", "right": "S0042FS 1Y1M BLC Curncy"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHGB Index", "right": "RR2YHUS Index"},
+        "Local - S&P500": {"type": "spread", "left": "UKX Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "UKX Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "UKX Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "UKX Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+    },
+    "jpy_df2": {
+        "USDJPY": {"type": "single", "col": "USDJPY Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY_ex_JPY"},
+        "Asia EMFX": {"type": "single", "col": "CTTWBUSA Index"},
+        "2y yield": {"type": "spread", "left": "USGG2YR Index", "right": "GTJPY2YR Corp"},
+        "5y yield": {"type": "spread", "left": "USGG5YR Index", "right": "GTJPY5YR Corp"},
+        "10y yield": {"type": "spread", "left": "USGG10YR Index", "right": "GTJPY10YR Corp"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHUS Index", "right": "RR2YHJP Index"},
+        "Local - S&P500": {"type": "spread", "left": "NXY Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "NXY Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "NXY Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "NXY Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+    },
+    "chf_df2": {
+        "USDCHF": {"type": "single", "col": "USDCHF Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY_ex_CHF"},
+        "EMFX": {"type": "single", "col": "EMFXDBET Index"},
+        "2y yield": {"type": "spread", "left": "USGG2YR Index", "right": "GTCHF2YR Corp"},
+        "5y yield": {"type": "spread", "left": "USGG5YR Index", "right": "GTCHF5YR Corp"},
+        "10y yield": {"type": "spread", "left": "USGG10YR Index", "right": "GTCHF10YR Corp"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHUS Index", "right": "RR2YHCH Index"},
+        "Local - S&P500": {"type": "spread", "left": "SMI Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "SMI Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "SMI Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "SMI Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+    },
+    "cad_df2": {
+        "USDCAD": {"type": "single", "col": "USDCAD Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY_ex_CAD"},
+        "EMFX": {"type": "single", "col": "EMFXDBET Index"},
+        "2y yield": {"type": "spread", "left": "USGG2YR Index", "right": "GTCAD2YR Corp"},
+        "5y yield": {"type": "spread", "left": "USGG5YR Index", "right": "GTCAD5YR Corp"},
+        "10y yield": {"type": "spread", "left": "USGG10YR Index", "right": "GTCAD10YR Corp"},
+        "3m1m forward OIS": {"type": "spread", "left": "S0042FS 3M1M BLC Curncy", "right": "G0007 3M1M BLC2 Curncy"},
+        "6m1m forward OIS": {"type": "spread", "left": "S0042FS 6M1M BLC Curncy", "right": "G0007 6M1M BLC2 Curncy"},
+        "1y1m forward OIS": {"type": "spread", "left": "S0042FS 1Y1M BLC Curncy", "right": "G0007 1Y1M BLC2 Curncy"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHUS Index", "right": "RR2YHCA Index"},
+        "Local - S&P500": {"type": "spread", "left": "SPTSX Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "SPTSX Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "SPTSX Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "SPTSX Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+        "Crude oil WCS": {"type": "single", "col": "USCRWCAS Index"},
+    },
+    "aud_df2": {
+        "AUDUSD": {"type": "single", "col": "AUDUSD Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY_ex_AUD"},
+        "Asia EMFX": {"type": "single", "col": "CTTWBUSA Index"},
+        "2y yield": {"type": "spread", "left": "GTAUD2YR Corp", "right": "USGG2YR Index"},
+        "5y yield": {"type": "spread", "left": "GTAUD5YR Corp", "right": "USGG5YR Index"},
+        "10y yield": {"type": "spread", "left": "GTAUD10YR Corp", "right": "USGG10YR Index"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHAU Index", "right": "RR2YHUS Index"},
+        "Local - S&P500": {"type": "spread", "left": "AS51 Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "AS51 Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "AS51 Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "AS51 Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+        "Iron ore": {"type": "single", "col": "SCOH6 COMB Comdty"},
+        "Coking coal": {"type": "single", "col": "IACA COMB Comdty"},
+    },
+    "nzd_df2": {
+        "NZDUSD": {"type": "single", "col": "NZDUSD Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY Curncy"},
+        "Asia EMFX": {"type": "single", "col": "CTTWBUSA Index"},
+        "2y yield": {"type": "spread", "left": "GTNZD2YR Corp", "right": "USGG2YR Index"},
+        "5y yield": {"type": "spread", "left": "GTNZD5YR Corp", "right": "USGG5YR Index"},
+        "10y yield": {"type": "spread", "left": "GTNZD10YR Corp", "right": "USGG10YR Index"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHnz Index", "right": "RR2YHUS Index"},
+        "Local - S&P500": {"type": "spread", "left": "NZX20X Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "NZX20X Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "NZX20X Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "NZX20X Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+        "Whole milk": {"type": "single", "col": "OMRA Comdty"},
+        "Skimmed milk": {"type": "single", "col": "FSPA Comdty"},
+    },
+    "sek_df2": {
+        "USDSEK": {"type": "single", "col": "USDSEK Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY Curncy"},
+        "EMFX": {"type": "single", "col": "EMFXDBET Index"},
+        "2y yield": {"type": "spread", "left": "USGG2YR Index", "right": "GTSEK2YR Corp"},
+        "5y yield": {"type": "spread", "left": "USGG5YR Index", "right": "GTSEK5YR Corp"},
+        "10y yield": {"type": "spread", "left": "USGG10YR Index", "right": "GTSEK10YR Corp"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHSE Index", "right": "RR2YHUS Index"},
+        "Local - S&P500": {"type": "spread", "left": "OMX Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "OMX Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "OMX Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "OMX Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+    },
+    "nok_df2": {
+        "USDNOK": {"type": "single", "col": "USDNOK Curncy"},
+        "BBDXY": {"type": "single", "col": "BBDXY Curncy"},
+        "EMFX": {"type": "single", "col": "EMFXDBET Index"},
+        "2y yield": {"type": "spread", "left": "USGG2YR Index", "right": "GTNOK2YR Corp"},
+        "5y yield": {"type": "spread", "left": "USGG5YR Index", "right": "GTNOK5YR Corp"},
+        "10y yield": {"type": "spread", "left": "USGG10YR Index", "right": "GTNOK10YR Corp"},
+        "Real 2y yield": {"type": "spread", "left": "RR2YHNO Index", "right": "RR2YHUS Index"},
+        "Local - S&P500": {"type": "spread", "left": "OBX Index", "right": "SPX Index"},
+        "Local - Wilshire": {"type": "spread", "left": "OBX Index", "right": "FTW5000 Index"},
+        "Local - Dow Jones": {"type": "spread", "left": "OBX Index", "right": "INDU Index"},
+        "MSCI World - S&P500": {"type": "spread", "left": "MXWO Index", "right": "SPX Index"},
+        "MSCI World - Wilshire": {"type": "spread", "left": "MXWO Index", "right": "FTW5000 Index"},
+        "MSCI World - Dow Jones": {"type": "spread", "left": "MXWO Index", "right": "INDU Index"},
+        "MSCI World ex-US": {"type": "single", "col": "MXWOU Index"},
+        "MSCI EM": {"type": "single", "col": "MXEF Index"},
+        "Local Index": {"type": "single", "col": "OBX Index"},
+        "BCOM Index": {"type": "single", "col": "BCOM Index"},
+        "Gold": {"type": "single", "col": "XAU Curncy"},
+        "Oil": {"type": "single", "col": "CO1 Comdty"},
+        "UK Natural Gas": {"type": "single", "col": "FN1 Comdty"},
+        "TTF Natural Gas": {"type": "single", "col": "TZT1 Comdty"},
+        "NY Natural Gas": {"type": "single", "col": "NG1 COMB Comdty"},
+        "Copper COMEX": {"type": "single", "col": "HGA Comdty"},
+        "Copper LME": {"type": "single", "col": "LMCADS03 Comdty"},
+        "VIX": {"type": "single", "col": "VIX Index"},
+        "USTs Volatility": {"type": "single", "col": "MOVE Index"},
+        "G10 FX Volatility": {"type": "single", "col": "JPMVG71M Index"},
+
+    },
+}
+
+# Backward-compatible alias (if notebooks referenced the old name).
+driver_specs_map = DRIVER_SPECS_MAP
+
+
+def build_processed_df_map(df2_map: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    """Build processed_df_map from df2_map and populate '<cur>_df_processed' globals."""
+    processed: Dict[str, pd.DataFrame] = {}
+
+    for name, df in df2_map.items():
+        if not name.endswith("_df2"):
+            continue
+        driver_specs = DRIVER_SPECS_MAP.get(name, {})
+        processed_df = process_dataframe(df, driver_specs)
+        processed_name = name.replace("_df2", "_df_processed")
+        processed[processed_name] = processed_df
+        globals()[processed_name] = processed_df
+
+    return processed
 
 
 # ---------------------------------------------------------------------------
 # Module-level build (import-friendly defaults)
 # ---------------------------------------------------------------------------
 
-frames, fx_newdf, df2_map = build_all()
+frames, fx_newdf, df2_map, processed_df_map = build_all(return_processed=True)
 
 # Convenience module-level variables (kept for backward compatibility)
 fx_df = frames["fx_df"]
@@ -256,6 +628,7 @@ __all__ = [
     "frames",
     "fx_newdf",
     "df2_map",
+    "processed_df_map",
     "fx_df",
     "usd_df",
     "eur_df",
@@ -270,6 +643,9 @@ __all__ = [
     "build_all",
     "build_fx_newdf",
     "build_df2_map",
+    "build_processed_df_map",
     "load_frames",
     "drop_columns",
+    "process_dataframe",
+    "driver_specs_map",
 ]
