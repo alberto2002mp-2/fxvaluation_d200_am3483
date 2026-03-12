@@ -25,8 +25,10 @@ if str(project_root) not in sys.path:
 
 
 from src.data.build_ultimate_df import build_ultimate_df
+from src.data.standardize_rolling_drivers import build_standardized_df_map
 
 ultimate_df = build_ultimate_df()
+standardized_df_map = build_standardized_df_map(ultimate_df)
 
 DEFAULT_Y_COL_MAP = {
     "eur": "EURUSD",
@@ -146,7 +148,7 @@ def build_rolling_maps(
 
 
 if __name__ == "__main__":
-    betas_map, signif_map = build_rolling_maps(ultimate_df, window=250)
+    betas_map, signif_map = build_rolling_maps(standardized_df_map, window=250)
     sample = "nok"
     if sample in betas_map:
         print(f"{sample} betas (tail):")

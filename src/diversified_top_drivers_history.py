@@ -23,6 +23,7 @@ if str(project_root) not in sys.path:
 
 
 from src.data.build_ultimate_df import build_ultimate_df
+from src.data.standardize_rolling_drivers import build_standardized_df_map
 from src.rolling_univariate_ols import build_rolling_maps
 
 
@@ -141,7 +142,8 @@ def build_diversified_top_drivers_map(
 
 if __name__ == "__main__":
     ultimate_df = build_ultimate_df()
-    betas_map, signif_map = build_rolling_maps(ultimate_df, window=250)
+    standardized_df_map = build_standardized_df_map(ultimate_df)
+    betas_map, signif_map = build_rolling_maps(standardized_df_map, window=250)
 
     diversified_top_drivers_map = build_diversified_top_drivers_map(
         betas_map, signif_map, min_significance=95.0, top_n=3
