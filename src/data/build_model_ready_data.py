@@ -121,36 +121,79 @@ def save_master_training_csvs(
     return master_map
 
 
-def get_model_ready_data(
+def _feature_alias_map(currency: str, suffix: str) -> Dict[str, str]:
+    """Map original feature names to sanitized master-CSV column names."""
+    raw_df = build_ultimate_df().get(currency)
+    if raw_df is None:
+        raise KeyError(f"{currency} not found in ultimate_df.")
+
+    y_col = DEFAULT_Y_COL_MAP.get(currency)
+    if y_col is None:
+        raise KeyError(f"No target column configured for {currency}.")
+
+    return {
+        f"{col}_{suffix}": f"{_sanitize_column_name(col)}_{suffix}"
+        for col in raw_df.columns
+        if col != y_col
+    }
+
+
+def get_master_training_data(
     currency: str,
-    model_type: str = "linear",
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
 ) -> pd.DataFrame:
-    """
-    Load a saved master CSV and return the feature slice for the requested model type.
-
-    `linear` -> standardized features (`_std`)
-    `gbm` -> raw features (`_raw`)
-    Always returns `Actual_Price` and `Log_Return`.
-    """
+    """Load the full saved master CSV for a currency."""
     csv_path = Path(processed_dir) / f"{currency}_master.csv"
     if not csv_path.exists():
         raise FileNotFoundError(
             f"{csv_path} does not exist. Run `save_master_training_csvs()` first."
         )
+    return pd.read_csv(csv_path, index_col="Date", parse_dates=["Date"])
 
-    df = pd.read_csv(csv_path, index_col="Date", parse_dates=["Date"])
+
+def get_model_ready_data(
+    currency: str,
+    model_type: str = "linear",
+    processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
+) -> pd.DataFrame:
+    df = get_master_training_data(currency, processed_dir=processed_dir)
+
     target_cols = ["Actual_Price", "Log_Return"]
 
     if model_type == "linear":
         feature_cols = [col for col in df.columns if col.endswith("_std")]
+        alias_map = _feature_alias_map(currency, "std")
     elif model_type == "gbm":
         feature_cols = [col for col in df.columns if col.endswith("_raw")]
+        alias_map = _feature_alias_map(currency, "raw")
     else:
         raise ValueError("model_type must be 'linear' or 'gbm'.")
 
-    keep_cols = target_cols + feature_cols
-    return df.loc[:, keep_cols]
+    top_aliases = {
+        "driver_1_name": ["driver_1_name", "Driver 1 Name"],
+        "driver_2_name": ["driver_2_name", "Driver 2 Name"],
+        "driver_3_name": ["driver_3_name", "Driver 3 Name"],
+        "driver_1_beta_z": ["driver_1_beta_z", "Driver 1 Beta Z"],
+        "driver_2_beta_z": ["driver_2_beta_z", "Driver 2 Beta Z"],
+        "driver_3_beta_z": ["driver_3_beta_z", "Driver 3 Beta Z"],
+        "driver_1_normal_beta": ["driver_1_normal_beta", "Driver 1 Normal Beta"],
+        "driver_2_normal_beta": ["driver_2_normal_beta", "Driver 2 Normal Beta"],
+        "driver_3_normal_beta": ["driver_3_normal_beta", "Driver 3 Normal Beta"],
+    }
+
+    out = df.loc[:, target_cols + feature_cols].copy()
+
+    for alias_col, stored_col in alias_map.items():
+        if stored_col in df.columns:
+            out[alias_col] = df[stored_col]
+
+    for alias_col, stored_candidates in top_aliases.items():
+        for stored_col in stored_candidates:
+            if stored_col in df.columns:
+                out[alias_col] = df[stored_col]
+                break
+
+    return out
 
 
 if __name__ == "__main__":
