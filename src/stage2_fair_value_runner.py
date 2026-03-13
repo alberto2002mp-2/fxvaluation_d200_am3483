@@ -25,6 +25,29 @@ if str(project_root) not in sys.path:
 from src.data.build_model_ready_data import DEFAULT_PROCESSED_DIR, get_model_ready_data
 
 
+def _compute_days_in_signal(error_z: pd.Series, threshold: float = 2.0) -> pd.Series:
+    """Count consecutive days where z-score stays above +threshold or below -threshold."""
+    regime = pd.Series(0, index=error_z.index, dtype=int)
+    regime = regime.where(~(error_z > threshold), 1)
+    regime = regime.where(~(error_z < -threshold), -1)
+
+    days = pd.Series(0, index=error_z.index, dtype=int)
+    run = 0
+    prev_regime = 0
+    for dt, current_regime in regime.items():
+        if current_regime == 0:
+            run = 0
+            prev_regime = 0
+        elif current_regime == prev_regime:
+            run += 1
+        else:
+            run = 1
+            prev_regime = current_regime
+        days.at[dt] = run
+
+    return days
+
+
 def plot_stage2_fair_value_plotly(
     res_df: pd.DataFrame,
     currency: str,
@@ -55,7 +78,7 @@ def plot_stage2_fair_value_plotly(
         row_heights=[0.65, 0.35],
         subplot_titles=(
             f"{currency.upper()} Fair Value Level Analysis",
-            "Trading Signal: Error Gap Z-Score",
+            "Trading Signal: Error Z-Score",
         ),
     )
 
@@ -131,6 +154,15 @@ def plot_stage2_fair_value_plotly(
     fig.add_hline(y=2, line_dash="dash", line_color="red", row=2, col=1)
     fig.add_hline(y=-2, line_dash="dash", line_color="green", row=2, col=1)
     fig.add_hline(y=0, line_dash="dot", line_color="grey", row=2, col=1)
+    fig.add_hrect(
+        y0=-1,
+        y1=1,
+        fillcolor="rgba(128, 128, 128, 0.12)",
+        line_width=0,
+        layer="below",
+        row=2,
+        col=1,
+    )
 
     fig.update_yaxes(title_text="Price Level", row=1, col=1)
     fig.update_yaxes(title_text="Z-score", row=2, col=1)
@@ -148,6 +180,7 @@ def plot_stage2_fair_value_plotly(
 def run_stage2_fair_value(
     currency: str,
     window: int = 50,
+    error_sum_window: int = 10,
     z_window: int = 50,
     return_scale: float = 100.0,
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
@@ -241,14 +274,21 @@ def run_stage2_fair_value(
         raise ValueError(f"No Stage 2 results were generated for {currency}.")
 
     res_df = pd.DataFrame(results).set_index("Date")
+    # EWMA provides a decayed persistence filter that emphasizes recent mispricing.
+    res_df["Cum_Error"] = res_df["Error"].ewm(
+        span=error_sum_window,
+        adjust=False,
+        min_periods=error_sum_window,
+    ).mean()
     res_df["Error_Z"] = (
-        res_df["Error"] - res_df["Error"].rolling(z_window).mean()
-    ) / res_df["Error"].rolling(z_window).std()
+        res_df["Cum_Error"] - res_df["Cum_Error"].rolling(z_window).mean()
+    ) / res_df["Cum_Error"].rolling(z_window).std()
     res_df["Signal"] = np.select(
         [res_df["Error_Z"] > 2.0, res_df["Error_Z"] < -2.0],
         ["SELL", "BUY"],
         default="NEUTRAL",
     )
+    res_df["Days_In_Signal"] = _compute_days_in_signal(res_df["Error_Z"], threshold=2.0)
 
     if start_date is not None:
         start_date = pd.Timestamp(start_date)
@@ -262,6 +302,80 @@ def run_stage2_fair_value(
         fig.show()
 
     return res_df
+
+
+def run_stage2_fair_value_ensemble(
+    currency: str,
+    fast_window: int = 50,
+    fast_error_sum_window: int = 5,
+    fast_z_window: int = 50,
+    slow_window: int = 125,
+    slow_error_sum_window: int = 20,
+    slow_z_window: int = 125,
+    confirmation_threshold: float = -1.5,
+    return_scale: float = 100.0,
+    processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
+    start_date: str | pd.Timestamp | None = None,
+    show_plot: bool = True,
+) -> pd.DataFrame:
+    """
+    Run fast/slow Stage 2 models and return an ensemble-confirmed signal.
+
+    Ensemble rule:
+    - STRONG BUY when both fast and slow Error_Z are below confirmation_threshold.
+    """
+    fast_df = run_stage2_fair_value(
+        currency=currency,
+        window=fast_window,
+        error_sum_window=fast_error_sum_window,
+        z_window=fast_z_window,
+        return_scale=return_scale,
+        processed_dir=processed_dir,
+        start_date=start_date,
+        show_plot=False,
+    )
+    slow_df = run_stage2_fair_value(
+        currency=currency,
+        window=slow_window,
+        error_sum_window=slow_error_sum_window,
+        z_window=slow_z_window,
+        return_scale=return_scale,
+        processed_dir=processed_dir,
+        start_date=start_date,
+        show_plot=False,
+    )
+
+    overlap = fast_df.index.intersection(slow_df.index)
+    if overlap.empty:
+        raise ValueError("Fast and slow model outputs do not overlap in time.")
+
+    out = fast_df.loc[overlap].copy()
+    out = out.rename(
+        columns={
+            "Error_Z": "Error_Z_Fast",
+            "Cum_Error": "Cum_Error_Fast",
+            "Signal": "Signal_Fast",
+            "Days_In_Signal": "Days_In_Signal_Fast",
+        }
+    )
+
+    out["Error_Z_Slow"] = slow_df.loc[overlap, "Error_Z"]
+    out["Cum_Error_Slow"] = slow_df.loc[overlap, "Cum_Error"]
+    out["Signal_Slow"] = slow_df.loc[overlap, "Signal"]
+    out["Days_In_Signal_Slow"] = slow_df.loc[overlap, "Days_In_Signal"]
+
+    strong_buy = (out["Error_Z_Fast"] < confirmation_threshold) & (
+        out["Error_Z_Slow"] < confirmation_threshold
+    )
+    out["Signal"] = np.where(strong_buy, "STRONG BUY", "NEUTRAL")
+
+    if show_plot:
+        plot_df = out.copy()
+        plot_df["Error_Z"] = plot_df["Error_Z_Fast"]
+        fig = plot_stage2_fair_value_plotly(plot_df, currency=currency, start_date=None)
+        fig.show()
+
+    return out
 
 
 if __name__ == "__main__":
