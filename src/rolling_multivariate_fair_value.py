@@ -29,6 +29,7 @@ if str(project_root) not in sys.path:
 
 
 from src.data.build_ultimate_df import build_ultimate_df
+from src.data.create_dataframes import fx_df as raw_fx_df
 from src.data.standardize_rolling_drivers import build_standardized_df_map
 from src.diversified_top_drivers_history import build_diversified_top_drivers_map
 from src.rolling_univariate_ols import DEFAULT_Y_COL_MAP, build_rolling_maps
@@ -45,6 +46,18 @@ RESULT_COLS = [
     "MAE",
     "Drivers_Used_Count",
 ]
+
+RAW_PRICE_COL_MAP = {
+    "eur": "EURUSD Curncy",
+    "gbp": "GBPUSD Curncy",
+    "jpy": "USDJPY Curncy",
+    "chf": "USDCHF Curncy",
+    "cad": "USDCAD Curncy",
+    "aud": "AUDUSD Curncy",
+    "nzd": "NZDUSD Curncy",
+    "nok": "USDNOK Curncy",
+    "sek": "USDSEK Curncy",
+}
 
 
 def _driver_name_cols(top_df: pd.DataFrame) -> List[str]:
@@ -133,6 +146,88 @@ def _adjusted_r2(r2: float, n_obs: int, n_features: int) -> float:
     if n_obs <= n_features + 1:
         return np.nan
     return 1 - (1 - r2) * ((n_obs - 1) / (n_obs - n_features - 1))
+
+
+def _rolling_zscore(series: pd.Series, window: int = 250) -> pd.Series:
+    """Return rolling z-score using the trailing window mean and std."""
+    rolling_mean = series.rolling(window=window, min_periods=window).mean()
+    rolling_std = series.rolling(window=window, min_periods=window).std()
+    return (series - rolling_mean) / rolling_std
+
+
+def _build_fair_value_anchor(
+    predicted_log_change: pd.Series,
+    actual_price_level: pd.Series,
+    return_scale: float = 100.0,
+) -> pd.Series:
+    """Compound predicted log changes from the first available actual level."""
+    anchor = pd.Series(index=predicted_log_change.index, dtype=float)
+    first_valid_idx = actual_price_level.first_valid_index()
+    if first_valid_idx is None:
+        return anchor
+
+    base_level = actual_price_level.loc[first_valid_idx]
+    if pd.isna(base_level):
+        return anchor
+
+    running_level = float(base_level)
+    started = False
+    for dt in predicted_log_change.index:
+        pred = predicted_log_change.loc[dt]
+        if dt == first_valid_idx:
+            anchor.loc[dt] = running_level
+            started = True
+            continue
+        if not started or pd.isna(pred):
+            anchor.loc[dt] = np.nan
+            continue
+        running_level = running_level * np.exp(pred / return_scale)
+        anchor.loc[dt] = running_level
+
+    return anchor
+
+
+def augment_with_price_levels_and_signals(
+    final_df: pd.DataFrame,
+    currency: str,
+    raw_price_df: pd.DataFrame | None = None,
+    signal_window: int = 250,
+    return_scale: float = 100.0,
+) -> pd.DataFrame:
+    """Add price-level fair values, residual z-scores, and trading signals."""
+    if raw_price_df is None:
+        raw_price_df = raw_fx_df
+
+    price_col = RAW_PRICE_COL_MAP.get(currency)
+    if price_col is None:
+        raise KeyError(f"No raw FX price column configured for {currency}.")
+    if price_col not in raw_price_df.columns:
+        raise KeyError(f"{price_col} not found in raw_price_df.")
+
+    out = final_df.copy()
+    out["Actual_Log_Change"] = out["Actual_Price"]
+    out["Predicted_Log_Change"] = out["Fair_Value"]
+
+    actual_price_level = raw_price_df[price_col].reindex(out.index)
+    out["Actual_Price_Level"] = actual_price_level
+    out["Fair_Value_Level"] = actual_price_level.shift(1) * np.exp(
+        out["Predicted_Log_Change"] / return_scale
+    )
+    out["Fair_Value_Anchor"] = _build_fair_value_anchor(
+        predicted_log_change=out["Predicted_Log_Change"],
+        actual_price_level=actual_price_level,
+        return_scale=return_scale,
+    )
+
+    out["Residual"] = out["Actual_Log_Change"] - out["Predicted_Log_Change"]
+    out["Residual_Zscore"] = _rolling_zscore(out["Residual"], window=signal_window)
+    out["Signal"] = np.select(
+        [out["Residual_Zscore"] > 2.0, out["Residual_Zscore"] < -2.0],
+        ["SELL", "BUY"],
+        default="NEUTRAL",
+    )
+
+    return out
 
 
 def build_currency_stage2_fv(
@@ -265,6 +360,9 @@ def build_final_fv_results(
     window: int = 250,
     top_n: int = 3,
     min_obs: int | None = None,
+    raw_price_df: pd.DataFrame | None = None,
+    signal_window: int = 250,
+    return_scale: float = 100.0,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
     """Build the Stage 2 fair value result map and the supporting metadata map."""
     if y_col_map is None:
@@ -290,7 +388,13 @@ def build_final_fv_results(
             top_n=top_n,
             min_obs=min_obs,
         )
-        final_fv_results[currency] = final_df
+        final_fv_results[currency] = augment_with_price_levels_and_signals(
+            final_df=final_df,
+            currency=currency,
+            raw_price_df=raw_price_df,
+            signal_window=signal_window,
+            return_scale=return_scale,
+        )
         fv_metadata_map[currency] = metadata_df
 
     return final_fv_results, fv_metadata_map
@@ -471,6 +575,82 @@ def plot_stage2_diagnostics_plotly(
     return fig
 
 
+def plot_level_signal_diagnostics(
+    final_fv_results: Dict[str, pd.DataFrame],
+    currency: str = "eur",
+) -> None:
+    """Plot actual/fair-value levels and residual z-score signal bands."""
+    result_df = final_fv_results.get(currency)
+    if result_df is None:
+        raise KeyError(f"{currency} not found in final_fv_results.")
+
+    level_df = result_df.dropna(subset=["Actual_Price_Level", "Fair_Value_Level"])
+    if level_df.empty:
+        raise ValueError(f"No complete price level rows available for {currency}.")
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(13, 8),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+
+    axes[0].plot(level_df.index, level_df["Actual_Price_Level"], label="Actual Price Level", linewidth=2.0)
+    axes[0].plot(
+        level_df.index,
+        level_df["Fair_Value_Level"],
+        label="Fair Value Level",
+        linewidth=2.0,
+        linestyle="--",
+    )
+    axes[0].set_title(f"{currency.upper()} Actual vs Reconstructed Fair Value Level")
+    axes[0].set_ylabel("Price Level")
+    axes[0].legend()
+
+    signal_df = result_df.dropna(subset=["Residual_Zscore"])
+    axes[1].plot(signal_df.index, signal_df["Residual_Zscore"], color="tab:purple", linewidth=1.8)
+    axes[1].axhline(2.0, color="red", linestyle="--", linewidth=1.2)
+    axes[1].axhline(-2.0, color="green", linestyle="--", linewidth=1.2)
+    axes[1].axhline(0.0, color="grey", linestyle=":", linewidth=1.0)
+    axes[1].set_title("Residual Z-score")
+    axes[1].set_ylabel("Z-score")
+    axes[1].set_xlabel("Date")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def generate_level_report(final_fv_results: Dict[str, pd.DataFrame]) -> None:
+    """Print the latest residual z-score and valuation status for each currency."""
+    print("\nStage 2 Level Report")
+    print("-" * 72)
+    for currency in sorted(final_fv_results):
+        df = final_fv_results[currency]
+        latest = df.dropna(subset=["Residual_Zscore"]).tail(1)
+        if latest.empty:
+            print(f"{currency.upper():<6}  no z-score available yet")
+            continue
+
+        row = latest.iloc[0]
+        zscore = float(row["Residual_Zscore"])
+        signal = str(row["Signal"])
+        price_level = row.get("Actual_Price_Level", np.nan)
+        fair_level = row.get("Fair_Value_Level", np.nan)
+
+        if zscore > 2.0:
+            status = "OVERBOUGHT"
+        elif zscore < -2.0:
+            status = "OVERSOLD"
+        else:
+            status = "NEUTRAL"
+
+        print(
+            f"{currency.upper():<6}  z={zscore:>6.2f}  signal={signal:<8}  "
+            f"status={status:<10}  actual={price_level:>10.4f}  fair={fair_level:>10.4f}"
+        )
+
+
 def build_inputs(window: int = 250) -> Tuple[
     Dict[str, pd.DataFrame],
     Dict[str, pd.DataFrame],
@@ -506,4 +686,6 @@ if __name__ == "__main__":
         print("\nEUR Stage 2 metadata (tail):")
         print(fv_metadata_map["eur"].tail())
 
+    generate_level_report(final_fv_results)
     plot_stage2_diagnostics(final_fv_results, currency="eur")
+    plot_level_signal_diagnostics(final_fv_results, currency="eur")
