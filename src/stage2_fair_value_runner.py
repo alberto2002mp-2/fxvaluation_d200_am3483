@@ -78,7 +78,7 @@ def plot_stage2_fair_value_plotly(
         row_heights=[0.65, 0.35],
         subplot_titles=(
             f"{currency.upper()} Fair Value Level Analysis",
-            "Trading Signal: Error Z-Score",
+            "Trading Signal: Detrended Gap Z-Score",
         ),
     )
 
@@ -96,9 +96,9 @@ def plot_stage2_fair_value_plotly(
     fig.add_trace(
         go.Scatter(
             x=plot_df.index,
-            y=plot_df["Fair_Value_Price"],
+            y=plot_df["Macro_Anchor_Price"],
             mode="lines",
-            name="Macro Fair Value",
+            name="Macro Anchor Price",
             line=dict(color="blue", width=2, dash="dash"),
         ),
         row=1,
@@ -108,9 +108,9 @@ def plot_stage2_fair_value_plotly(
     fig.add_trace(
         go.Scatter(
             x=plot_df.index,
-            y=plot_df["Error_Z"],
+            y=plot_df["Signal_Z"],
             mode="lines",
-            name="Error Z-score",
+            name="Signal Z-score",
             line=dict(color="purple", width=2),
         ),
         row=2,
@@ -118,7 +118,7 @@ def plot_stage2_fair_value_plotly(
     )
 
     sell_df = plot_df.copy()
-    sell_df["sell_fill"] = np.where(sell_df["Error_Z"] > 2, sell_df["Error_Z"], np.nan)
+    sell_df["sell_fill"] = np.where(sell_df["Signal_Z"] > 2, sell_df["Signal_Z"], np.nan)
     fig.add_trace(
         go.Scatter(
             x=sell_df.index,
@@ -135,7 +135,7 @@ def plot_stage2_fair_value_plotly(
     )
 
     buy_df = plot_df.copy()
-    buy_df["buy_fill"] = np.where(buy_df["Error_Z"] < -2, buy_df["Error_Z"], np.nan)
+    buy_df["buy_fill"] = np.where(buy_df["Signal_Z"] < -2, buy_df["Signal_Z"], np.nan)
     fig.add_trace(
         go.Scatter(
             x=buy_df.index,
@@ -150,6 +150,26 @@ def plot_stage2_fair_value_plotly(
         row=2,
         col=1,
     )
+
+    if "Recenter_Event" in plot_df.columns:
+        recenter_dates = plot_df.index[plot_df["Recenter_Event"].fillna(False)]
+        for dt in recenter_dates:
+            fig.add_vline(
+                x=dt,
+                line_dash="dash",
+                line_color="rgba(80, 80, 80, 0.55)",
+                line_width=1,
+                row=1,
+                col=1,
+            )
+            fig.add_vline(
+                x=dt,
+                line_dash="dash",
+                line_color="rgba(80, 80, 80, 0.55)",
+                line_width=1,
+                row=2,
+                col=1,
+            )
 
     fig.add_hline(y=2, line_dash="dash", line_color="red", row=2, col=1)
     fig.add_hline(y=-2, line_dash="dash", line_color="green", row=2, col=1)
@@ -181,7 +201,8 @@ def run_stage2_fair_value(
     currency: str,
     window: int = 50,
     error_sum_window: int = 10,
-    z_window: int = 50,
+    z_window: int | None = None,
+    recenter_window: int = 60,
     return_scale: float = 100.0,
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
     start_date: str | pd.Timestamp | None = None,
@@ -193,7 +214,8 @@ def run_stage2_fair_value(
     Notes:
     - Uses raw (`*_raw`) features for fitting.
     - Uses `Log_Return` as the target.
-    - Reconstructs `Fair_Value_Price` from the prior actual price and predicted log change.
+    - Builds a cumulative `Macro_Anchor_Price` from predicted log changes.
+    - Applies regime-based re-centering every `recenter_window` days.
     - `return_scale=100.0` matches the project's use of `100 * log-diff`.
     """
     df = get_model_ready_data(currency, model_type="gbm", processed_dir=processed_dir).copy()
@@ -210,7 +232,15 @@ def run_stage2_fair_value(
     if missing:
         raise KeyError(f"Missing required columns for Stage 2 run: {missing}")
 
+    if recenter_window <= 0:
+        raise ValueError("recenter_window must be a positive integer.")
+    signal_window = recenter_window if z_window is None else z_window
+    if signal_window <= 0:
+        raise ValueError("z_window must be a positive integer when provided.")
+
     results = []
+    fv_anchor = float(df["Actual_Price"].iloc[0])
+    last_recenter_i = 0
 
     for i in range(window, len(df)):
         current_date = df.index[i]
@@ -246,27 +276,34 @@ def run_stage2_fair_value(
 
         actual_log_change = df.at[current_date, "Log_Return"]
         current_price = df.at[current_date, "Actual_Price"]
-        prev_price = df.at[df.index[i - 1], "Actual_Price"]
-        if pd.isna(actual_log_change) or pd.isna(current_price) or pd.isna(prev_price):
+        if pd.isna(actual_log_change) or pd.isna(current_price):
             continue
+
+        recentered = False
+        if (i - last_recenter_i) >= recenter_window:
+            fv_anchor = float(current_price)
+            last_recenter_i = i
+            recentered = True
 
         model = LinearRegression(fit_intercept=True)
         model.fit(X_train, y_train)
 
         pred_log_change = float(model.predict(X_now)[0])
-        fv_level = float(prev_price * np.exp(pred_log_change / return_scale))
+        fv_anchor = float(fv_anchor * np.exp(pred_log_change / return_scale))
         error = float(actual_log_change - pred_log_change)
 
         results.append(
             {
                 "Date": current_date,
                 "Actual_Price": current_price,
-                "Fair_Value_Price": fv_level,
+            "Macro_Anchor_Price": fv_anchor,
+            "Fair_Value_Price": fv_anchor,
                 "Actual_Ret": float(actual_log_change),
                 "Pred_Ret": pred_log_change,
                 "Error": error,
                 "Drivers_Used_Count": len(active_drivers),
                 "Drivers_Used": ", ".join(active_drivers),
+                "Recenter_Event": recentered,
             }
         )
 
@@ -274,21 +311,26 @@ def run_stage2_fair_value(
         raise ValueError(f"No Stage 2 results were generated for {currency}.")
 
     res_df = pd.DataFrame(results).set_index("Date")
-    # EWMA provides a decayed persistence filter that emphasizes recent mispricing.
+    # Kept for compatibility with existing notebook exploration.
     res_df["Cum_Error"] = res_df["Error"].ewm(
         span=error_sum_window,
         adjust=False,
         min_periods=error_sum_window,
     ).mean()
-    res_df["Error_Z"] = (
-        res_df["Cum_Error"] - res_df["Cum_Error"].rolling(z_window).mean()
-    ) / res_df["Cum_Error"].rolling(z_window).std()
+    res_df["Macro_Gap"] = res_df["Actual_Price"] - res_df["Macro_Anchor_Price"]
+    # Bias-correction technique: periodic re-centering reduces structural model bias
+    # while preserving tactical variance for short-horizon mispricing detection.
+    res_df["Signal_Z"] = (
+        res_df["Macro_Gap"] - res_df["Macro_Gap"].rolling(signal_window).mean()
+    ) / res_df["Macro_Gap"].rolling(signal_window).std()
+    # Compatibility alias for existing downstream workflows.
+    res_df["Error_Z"] = res_df["Signal_Z"]
     res_df["Signal"] = np.select(
-        [res_df["Error_Z"] > 2.0, res_df["Error_Z"] < -2.0],
+        [res_df["Signal_Z"] > 2.0, res_df["Signal_Z"] < -2.0],
         ["SELL", "BUY"],
         default="NEUTRAL",
     )
-    res_df["Days_In_Signal"] = _compute_days_in_signal(res_df["Error_Z"], threshold=2.0)
+    res_df["Days_In_Signal"] = _compute_days_in_signal(res_df["Signal_Z"], threshold=2.0)
 
     if start_date is not None:
         start_date = pd.Timestamp(start_date)
@@ -312,6 +354,7 @@ def run_stage2_fair_value_ensemble(
     slow_window: int = 125,
     slow_error_sum_window: int = 20,
     slow_z_window: int = 125,
+    recenter_window: int = 60,
     confirmation_threshold: float = -1.5,
     return_scale: float = 100.0,
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
@@ -333,6 +376,7 @@ def run_stage2_fair_value_ensemble(
         processed_dir=processed_dir,
         start_date=start_date,
         show_plot=False,
+        recenter_window=recenter_window,
     )
     slow_df = run_stage2_fair_value(
         currency=currency,
@@ -343,6 +387,7 @@ def run_stage2_fair_value_ensemble(
         processed_dir=processed_dir,
         start_date=start_date,
         show_plot=False,
+        recenter_window=recenter_window,
     )
 
     overlap = fast_df.index.intersection(slow_df.index)
@@ -352,15 +397,17 @@ def run_stage2_fair_value_ensemble(
     out = fast_df.loc[overlap].copy()
     out = out.rename(
         columns={
+            "Signal_Z": "Signal_Z_Fast",
             "Error_Z": "Error_Z_Fast",
-            "Cum_Error": "Cum_Error_Fast",
+            "Macro_Gap": "Macro_Gap_Fast",
             "Signal": "Signal_Fast",
             "Days_In_Signal": "Days_In_Signal_Fast",
         }
     )
 
+    out["Signal_Z_Slow"] = slow_df.loc[overlap, "Signal_Z"]
     out["Error_Z_Slow"] = slow_df.loc[overlap, "Error_Z"]
-    out["Cum_Error_Slow"] = slow_df.loc[overlap, "Cum_Error"]
+    out["Macro_Gap_Slow"] = slow_df.loc[overlap, "Macro_Gap"]
     out["Signal_Slow"] = slow_df.loc[overlap, "Signal"]
     out["Days_In_Signal_Slow"] = slow_df.loc[overlap, "Days_In_Signal"]
 
@@ -371,6 +418,7 @@ def run_stage2_fair_value_ensemble(
 
     if show_plot:
         plot_df = out.copy()
+        plot_df["Signal_Z"] = plot_df["Signal_Z_Fast"]
         plot_df["Error_Z"] = plot_df["Error_Z_Fast"]
         fig = plot_stage2_fair_value_plotly(plot_df, currency=currency, start_date=None)
         fig.show()
