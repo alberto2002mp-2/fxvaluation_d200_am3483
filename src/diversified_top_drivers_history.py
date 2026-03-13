@@ -73,29 +73,32 @@ def build_diversified_top_drivers_map(
     signif_map: Dict[str, pd.DataFrame],
     min_significance: float = 95.0,
     top_n: int = 3,
+    betas_raw_map: Dict[str, pd.DataFrame] | None = None,
 ) -> Dict[str, pd.DataFrame]:
-    """Return a map of DataFrames with diversified top driver names/betas per date."""
+    """Return diversified top drivers per date with standardized and raw betas."""
     out_map: Dict[str, pd.DataFrame] = {}
 
-    out_cols = [
-        "Driver 1 Name",
-        "Driver 1 Beta",
-        "Driver 2 Name",
-        "Driver 2 Beta",
-        "Driver 3 Name",
-        "Driver 3 Beta",
-    ]
+    name_cols = [f"Driver {i} Name" for i in range(1, top_n + 1)]
+    beta_z_cols = [f"Driver {i} Beta Z" for i in range(1, top_n + 1)]
+    beta_raw_cols = [f"Driver {i} Normal Beta" for i in range(1, top_n + 1)]
+    out_cols = name_cols + beta_z_cols + beta_raw_cols
 
     for currency, betas_df in betas_map.items():
         signif_df = signif_map.get(currency)
         if signif_df is None:
             continue
+        raw_betas_df = None if betas_raw_map is None else betas_raw_map.get(currency)
 
         out_df = pd.DataFrame(index=betas_df.index, columns=out_cols, dtype=object)
 
         for dt in betas_df.index:
             row_betas = betas_df.loc[dt]
             row_signif = signif_df.loc[dt]
+            row_raw_betas = (
+                raw_betas_df.loc[dt]
+                if raw_betas_df is not None and dt in raw_betas_df.index
+                else pd.Series(dtype=float)
+            )
 
             sig_mask = row_signif >= min_significance
             sig_betas = row_betas[sig_mask].dropna()
@@ -122,18 +125,15 @@ def build_diversified_top_drivers_map(
             top_idx = winners_series.abs().sort_values(ascending=False).head(top_n).index
 
             top_names = list(top_idx) + [np.nan] * (top_n - len(top_idx))
-            top_betas = [winners_series.get(name) for name in top_idx] + [
+            top_betas_z = [winners_series.get(name) for name in top_idx] + [
                 np.nan
             ] * (top_n - len(top_idx))
-
-            out_df.loc[dt] = [
-                top_names[0],
-                top_betas[0],
-                top_names[1],
-                top_betas[1],
-                top_names[2],
-                top_betas[2],
+            top_betas_raw = [
+                row_raw_betas.get(name, np.nan) if pd.notna(name) else np.nan
+                for name in top_names
             ]
+
+            out_df.loc[dt] = top_names + top_betas_z + top_betas_raw
 
         out_map[currency] = out_df
 
@@ -144,9 +144,14 @@ if __name__ == "__main__":
     ultimate_df = build_ultimate_df()
     standardized_df_map = build_standardized_df_map(ultimate_df)
     betas_map, signif_map = build_rolling_maps(standardized_df_map, window=250)
+    betas_raw_map, _ = build_rolling_maps(ultimate_df, window=250)
 
     diversified_top_drivers_map = build_diversified_top_drivers_map(
-        betas_map, signif_map, min_significance=95.0, top_n=3
+        betas_map,
+        signif_map,
+        min_significance=95.0,
+        top_n=3,
+        betas_raw_map=betas_raw_map,
     )
 
     for sample in ("aud", "nok"):
