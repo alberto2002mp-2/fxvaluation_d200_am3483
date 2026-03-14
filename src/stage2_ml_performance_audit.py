@@ -685,6 +685,43 @@ def _build_interpretability_hits(audit_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _best_tuning_event(audit_df: pd.DataFrame) -> Dict[str, Any]:
+    """Return the best tuning event ranked by validation RMSE."""
+    if "Retuned" in audit_df.columns and audit_df["Retuned"].notna().any():
+        tune_df = audit_df.loc[audit_df["Retuned"] == True].copy()
+    else:
+        tune_df = audit_df.copy()
+
+    if "Validation_RMSE" in tune_df.columns:
+        tune_df = tune_df.loc[tune_df["Validation_RMSE"].notna()].copy()
+    if tune_df.empty:
+        return {}
+
+    best_row = tune_df.sort_values(by="Validation_RMSE", ascending=True).iloc[0]
+    return {
+        "Best_Params": best_row.get("Best_Params", ""),
+        "Best_Validation_RMSE": float(best_row["Validation_RMSE"])
+        if pd.notna(best_row.get("Validation_RMSE"))
+        else np.nan,
+        "Best_Alpha": float(best_row["Alpha"]) if pd.notna(best_row.get("Alpha")) else np.nan,
+        "Best_L1_Ratio": float(best_row["L1_Ratio"])
+        if pd.notna(best_row.get("L1_Ratio"))
+        else np.nan,
+        "Best_N_Estimators": int(best_row["N_Estimators"])
+        if pd.notna(best_row.get("N_Estimators"))
+        else np.nan,
+        "Best_Max_Depth": int(best_row["Max_Depth"])
+        if pd.notna(best_row.get("Max_Depth"))
+        else np.nan,
+        "Best_Learning_Rate": float(best_row["Learning_Rate"])
+        if pd.notna(best_row.get("Learning_Rate"))
+        else np.nan,
+        "Best_Subsample": float(best_row["Subsample"])
+        if pd.notna(best_row.get("Subsample"))
+        else np.nan,
+    }
+
+
 def _summarize_model_audit(
     model_name: str,
     currency: str,
@@ -706,8 +743,9 @@ def _summarize_model_audit(
         if "Validation_RMSE" in audit_df and audit_df["Validation_RMSE"].notna().any()
         else np.nan
     )
+    tuning_summary = _best_tuning_event(audit_df)
 
-    return {
+    row = {
         "Currency": currency.upper(),
         "Model": MODEL_LABELS.get(model_name, model_name.upper()),
         "Observations": len(audit_df),
@@ -723,6 +761,8 @@ def _summarize_model_audit(
         "Test_RMSE": test_rmse,
         "Generalization_Gap": test_rmse - avg_train_rmse if pd.notna(avg_train_rmse) else np.nan,
     }
+    row.update(tuning_summary)
+    return row
 
 
 def _plot_multi_model_equity_curves(

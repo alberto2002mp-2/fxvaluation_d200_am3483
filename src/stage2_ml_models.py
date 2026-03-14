@@ -608,6 +608,7 @@ def run_stage2_model(
     last_tuned_i: int | None = None
     selected_params: Dict[str, Any] = {}
     validation_rmse = np.nan
+    retuned = False
 
     for i in range(window, len(df)):
         current_date = df.index[i]
@@ -648,6 +649,9 @@ def run_stage2_model(
                     early_stopping_rounds=early_stopping_rounds,
                 )
                 last_tuned_i = i
+                retuned = True
+            else:
+                retuned = False
         else:
             selected_params, validation_rmse = _select_model_params(
                 model_name=model_name,
@@ -657,6 +661,7 @@ def run_stage2_model(
                 random_state=random_state,
                 early_stopping_rounds=early_stopping_rounds,
             )
+            retuned = True
 
         recentered = False
         if (i - last_recenter_i) >= recenter_window:
@@ -737,6 +742,21 @@ def run_stage2_model(
                 "Driver_3_SHAP": shap_contribs[2],
                 "Attribution_Method": "SHAP" if model_name in TREE_MODELS else "BETA",
                 "Best_Params": json.dumps(selected_params, sort_keys=True),
+                "Alpha": float(selected_params["alpha"]) if "alpha" in selected_params else np.nan,
+                "L1_Ratio": float(selected_params["l1_ratio"]) if "l1_ratio" in selected_params else np.nan,
+                "N_Estimators": int(selected_params["n_estimators"])
+                if "n_estimators" in selected_params
+                else np.nan,
+                "Max_Depth": int(selected_params["max_depth"])
+                if "max_depth" in selected_params
+                else np.nan,
+                "Learning_Rate": float(selected_params["learning_rate"])
+                if "learning_rate" in selected_params
+                else np.nan,
+                "Subsample": float(selected_params["subsample"])
+                if "subsample" in selected_params
+                else np.nan,
+                "Retuned": retuned,
                 "Recenter_Event": recentered,
             }
         )
