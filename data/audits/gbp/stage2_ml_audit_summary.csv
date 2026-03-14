@@ -1,0 +1,2 @@
+Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Maximum_Drawdown_Pct
+GBP,6427,218,122,96,119,99,54.58715596330275,-0.040452911736401496,0.3184853534358888,0.41722591286680316,0.4214673636443498,12.333539026675666,-14.257695537860693

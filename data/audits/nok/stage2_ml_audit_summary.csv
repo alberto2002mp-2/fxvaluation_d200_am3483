@@ -1,0 +1,2 @@
+Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Maximum_Drawdown_Pct
+NOK,6426,219,115,104,104,115,47.48858447488584,0.00754744819728797,0.3647797136062048,0.539252695168509,0.5447570845902997,44.73709395780081,-12.48514569660153

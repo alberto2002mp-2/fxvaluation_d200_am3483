@@ -1,0 +1,2 @@
+Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Maximum_Drawdown_Pct
+SEK,6427,230,114,116,114,116,49.56521739130435,0.000525501819430591,0.3521092644989289,0.5208777742557292,0.5261782195803255,28.407516703886927,-11.124177242909038

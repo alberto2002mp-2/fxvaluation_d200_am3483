@@ -1,0 +1,2 @@
+Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Maximum_Drawdown_Pct
+AUD,6427,235,146,89,107,128,45.53191489361702,-0.02228933553966668,0.3705741470031936,0.5054249565609591,0.5105671955766085,45.2605454122917,-8.342562822489352
