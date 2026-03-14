@@ -77,6 +77,20 @@ def _max_drawdown(equity_curve: pd.Series) -> float:
     return float(drawdown.min())
 
 
+def _annualized_sharpe_ratio(daily_returns: pd.Series, periods_per_year: int = 252) -> float:
+    """Return the annualized Sharpe ratio of a daily return series."""
+    clean = daily_returns.dropna()
+    if clean.empty:
+        return np.nan
+
+    volatility = float(clean.std(ddof=1))
+    if np.isclose(volatility, 0.0):
+        return np.nan
+
+    mean_return = float(clean.mean())
+    return mean_return / volatility * np.sqrt(periods_per_year)
+
+
 def _largest_beta_driver(row: pd.Series) -> pd.Series:
     """Return the driver with the largest absolute beta on this date."""
     candidates = []
@@ -157,6 +171,7 @@ def build_stage2_audit_dataset(
     forward_days: int = 10,
     threshold: float = 2.0,
     return_scale: float = 100.0,
+    sharpe_window: int = 252,
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
     start_date: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
@@ -338,6 +353,15 @@ def build_stage2_audit_dataset(
     res_df["Position"] = res_df["Signal"].map(position_map).fillna(0.0)
     res_df["Strategy_Daily_Return"] = res_df["Position"].shift(1).fillna(0.0) * daily_returns
     res_df["Strategy_Equity_Curve"] = (1.0 + res_df["Strategy_Daily_Return"]).cumprod()
+    rolling_mean = res_df["Strategy_Daily_Return"].rolling(
+        window=sharpe_window,
+        min_periods=sharpe_window,
+    ).mean()
+    rolling_std = res_df["Strategy_Daily_Return"].rolling(
+        window=sharpe_window,
+        min_periods=sharpe_window,
+    ).std()
+    res_df["Rolling_Sharpe"] = (rolling_mean / rolling_std) * np.sqrt(252)
     res_df["Strategy_Drawdown"] = (
         res_df["Strategy_Equity_Curve"] / res_df["Strategy_Equity_Curve"].cummax() - 1.0
     )
@@ -363,6 +387,7 @@ def build_stage2_ml_performance_audit(
     forward_days: int = 10,
     threshold: float = 2.0,
     return_scale: float = 100.0,
+    sharpe_window: int = 252,
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
     start_date: str | pd.Timestamp | None = None,
 ) -> Dict[str, pd.DataFrame]:
@@ -376,6 +401,7 @@ def build_stage2_ml_performance_audit(
         forward_days=forward_days,
         threshold=threshold,
         return_scale=return_scale,
+        sharpe_window=sharpe_window,
         processed_dir=processed_dir,
         start_date=start_date,
     )
@@ -417,6 +443,14 @@ def build_stage2_ml_performance_audit(
                     (res_df["Strategy_Equity_Curve"].iloc[-1] - 1.0) * 100.0
                 )
                 if not res_df.empty
+                else np.nan,
+                "Strategy_Sharpe_Ratio": float(
+                    _annualized_sharpe_ratio(res_df["Strategy_Daily_Return"])
+                )
+                if not res_df.empty
+                else np.nan,
+                "Average_Rolling_Sharpe": float(res_df["Rolling_Sharpe"].dropna().mean())
+                if res_df["Rolling_Sharpe"].notna().any()
                 else np.nan,
                 "Maximum_Drawdown_Pct": float(
                     _max_drawdown(res_df["Strategy_Equity_Curve"]) * 100.0
@@ -479,6 +513,32 @@ def _plot_generalization_metrics(
     plt.close(fig)
 
 
+def _plot_strategy_equity_curve(
+    audit_df: pd.DataFrame,
+    currency: str,
+    output_path: str | Path,
+) -> None:
+    """Save a time-series chart of the strategy equity curve."""
+    plot_df = audit_df.loc[audit_df["Strategy_Equity_Curve"].notna()]
+    if plot_df.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(
+        plot_df.index,
+        plot_df["Strategy_Equity_Curve"],
+        color="tab:blue",
+        linewidth=1.6,
+    )
+    ax.axhline(1.0, color="grey", linestyle=":", linewidth=1.0)
+    ax.set_title(f"{currency.upper()} Stage 2 Strategy Equity Curve")
+    ax.set_ylabel("Equity Curve")
+    ax.set_xlabel("Date")
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_stage2_ml_performance_audit(
     currency: str,
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
@@ -495,12 +555,18 @@ def save_stage2_ml_performance_audit(
     triggers_path = currency_dir / "stage2_signal_triggers.csv"
     hits_path = currency_dir / "stage2_hit_interpretability.csv"
     plot_path = currency_dir / "stage2_generalization_metrics.png"
+    equity_plot_path = currency_dir / "stage2_strategy_equity_curve.png"
 
     audit["summary"].to_csv(summary_path, index=False)
     audit["audit_dataset"].to_csv(audit_path, index=True)
     audit["signal_triggers"].to_csv(triggers_path, index=True)
     audit["interpretability_hits"].to_csv(hits_path, index=True)
     _plot_generalization_metrics(audit["audit_dataset"], currency=currency, output_path=plot_path)
+    _plot_strategy_equity_curve(
+        audit["audit_dataset"],
+        currency=currency,
+        output_path=equity_plot_path,
+    )
 
     return {
         "summary_csv": summary_path,
@@ -508,6 +574,7 @@ def save_stage2_ml_performance_audit(
         "signal_triggers_csv": triggers_path,
         "interpretability_hits_csv": hits_path,
         "generalization_plot_png": plot_path,
+        "strategy_equity_curve_png": equity_plot_path,
     }
 
 
@@ -553,6 +620,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Scaling used to compound predicted log returns into levels.",
     )
     parser.add_argument(
+        "--sharpe-window",
+        type=int,
+        default=252,
+        help="Rolling window used for the rolling Sharpe ratio series.",
+    )
+    parser.add_argument(
         "--processed-dir",
         default=DEFAULT_PROCESSED_DIR,
         help="Directory containing the saved master CSVs.",
@@ -584,6 +657,7 @@ def main() -> None:
         forward_days=args.forward_days,
         threshold=args.threshold,
         return_scale=args.return_scale,
+        sharpe_window=args.sharpe_window,
         processed_dir=args.processed_dir,
         output_dir=args.output_dir,
         start_date=args.start_date,

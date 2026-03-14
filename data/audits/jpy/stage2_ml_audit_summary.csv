@@ -1,2 +1,2 @@
-Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Maximum_Drawdown_Pct
-JPY,6426,225,118,107,107,118,47.55555555555556,0.04252107824563532,0.3507680229579246,0.4367038195577609,0.4411438404224987,-2.8957311015081033,-14.212857490194786
+Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Strategy_Sharpe_Ratio,Average_Rolling_Sharpe,Maximum_Drawdown_Pct
+JPY,6426,225,118,107,107,118,47.55555555555556,0.04252107824563532,0.3507680229579246,0.4367038195577609,0.4411438404224987,-2.8957311015081033,-0.007235770936928984,0.07490952130130725,-14.212857490194786

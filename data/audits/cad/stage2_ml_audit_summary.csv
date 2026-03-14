@@ -1,2 +1,2 @@
-Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Maximum_Drawdown_Pct
-CAD,6424,238,117,121,111,127,46.63865546218487,-0.03760511412353282,0.35600174006231866,0.3682963765805237,0.3720484908834853,17.016451556375145,-11.095118147598882
+Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Strategy_Sharpe_Ratio,Average_Rolling_Sharpe,Maximum_Drawdown_Pct
+CAD,6424,238,117,121,111,127,46.63865546218487,-0.03760511412353282,0.35600174006231866,0.3682963765805237,0.3720484908834853,17.016451556375145,0.23514092561995054,0.19944502333542866,-11.095118147598882

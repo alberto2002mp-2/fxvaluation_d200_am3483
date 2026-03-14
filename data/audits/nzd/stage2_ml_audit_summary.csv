@@ -1,2 +1,2 @@
-Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Maximum_Drawdown_Pct
-NZD,6427,200,112,88,96,104,48.0,-0.045764136112829465,0.30374624042003867,0.5597216446035919,0.5654207023192458,15.717479865021545,-13.87598697954453
+Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Strategy_Sharpe_Ratio,Average_Rolling_Sharpe,Maximum_Drawdown_Pct
+NZD,6427,200,112,88,96,104,48.0,-0.045764136112829465,0.30374624042003867,0.5597216446035919,0.5654207023192458,15.717479865021545,0.17020385380760597,0.1850444273758642,-13.87598697954453
