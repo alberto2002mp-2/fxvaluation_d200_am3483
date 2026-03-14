@@ -1,0 +1,2 @@
+Currency,Observations,Signal_Triggers,BUY_Triggers,SELL_Triggers,Hit_Count,Miss_Count,Average_Hit_Rate_Pct,Information_Coefficient,Average_Adj_R2,Average_RMSE,Average_Residual_STD,Strategy_Total_Return_Pct,Maximum_Drawdown_Pct
+EUR,6427,231,130,101,111,120,48.05194805194805,0.029454577125659277,0.3813759991463594,0.39654254845270276,0.400568738922561,-4.943893389443355,-21.17258867812345
