@@ -28,6 +28,7 @@ if str(project_root) not in sys.path:
 
 DEFAULT_PROCESSED_DIR = project_root / "data" / "processed"
 DEFAULT_AUDIT_DIR = project_root / "data" / "audits"
+DEFAULT_CURRENCIES = ("eur", "gbp", "aud", "nzd", "cad", "jpy", "chf", "nok", "sek")
 
 
 from src.stage2_ml_models import DEFAULT_MODELS, MODEL_LABELS, run_stage2_model_suite
@@ -900,10 +901,82 @@ def save_stage2_model_comparison_audit(
 
     for model_name, audit_df in audit["audit_map"].items():
         model_audit_path = currency_dir / f"stage2_{model_name}_audit_dataset.csv"
+        model_generalization_path = currency_dir / f"stage2_{model_name}_generalization_metrics.png"
+        model_equity_path = currency_dir / f"stage2_{model_name}_strategy_equity_curve.png"
         audit_df.to_csv(model_audit_path, index=True)
+        _plot_generalization_metrics(
+            audit_df=audit_df,
+            currency=f"{currency.upper()} {MODEL_LABELS.get(model_name, model_name.upper())}",
+            output_path=model_generalization_path,
+        )
+        _plot_strategy_equity_curve(
+            audit_df=audit_df,
+            currency=f"{currency.upper()} {MODEL_LABELS.get(model_name, model_name.upper())}",
+            output_path=model_equity_path,
+        )
         saved_paths[f"{model_name}_audit_dataset_csv"] = model_audit_path
+        saved_paths[f"{model_name}_generalization_plot_png"] = model_generalization_path
+        saved_paths[f"{model_name}_equity_curve_png"] = model_equity_path
 
     return saved_paths
+
+
+def build_g10_master_comparison_table(
+    comparison_summaries: Sequence[pd.DataFrame],
+) -> pd.DataFrame:
+    """Aggregate per-currency comparison summaries into one master ranking table."""
+    combined = pd.concat(comparison_summaries, axis=0, ignore_index=True)
+
+    grouped = (
+        combined.groupby("Model", as_index=False)
+        .agg(
+            Currencies=("Currency", "nunique"),
+            Average_Information_Coefficient=("Information_Coefficient", "mean"),
+            Average_Hit_Rate_Pct=("Hit_Rate_Pct", "mean"),
+            Average_Sharpe_Ratio=("Sharpe_Ratio", "mean"),
+            Average_Maximum_Drawdown_Pct=("Maximum_Drawdown_Pct", "mean"),
+            Average_Generalization_Gap=("Generalization_Gap", "mean"),
+        )
+    )
+    grouped["IC_Rank"] = grouped["Average_Information_Coefficient"].rank(
+        ascending=False,
+        method="dense",
+    )
+    grouped["Hit_Rank"] = grouped["Average_Hit_Rate_Pct"].rank(
+        ascending=False,
+        method="dense",
+    )
+    grouped["Combined_Rank"] = (grouped["IC_Rank"] + grouped["Hit_Rank"]) / 2.0
+    grouped = grouped.sort_values(
+        by=["Combined_Rank", "Average_Information_Coefficient", "Average_Hit_Rate_Pct"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+    return grouped
+
+
+def save_stage2_g10_master_comparison(
+    currencies: Sequence[str] = DEFAULT_CURRENCIES,
+    models: Sequence[str] = DEFAULT_MODELS,
+    output_dir: str | Path = DEFAULT_AUDIT_DIR,
+    **kwargs,
+) -> Dict[str, Path]:
+    """Run and save the comparison audit for the full currency universe plus a master table."""
+    comparison_summaries: list[pd.DataFrame] = []
+
+    for currency in currencies:
+        save_stage2_model_comparison_audit(
+            currency=currency,
+            models=models,
+            output_dir=output_dir,
+            **kwargs,
+        )
+        summary_path = Path(output_dir) / currency.lower() / "stage2_model_comparison_summary.csv"
+        comparison_summaries.append(pd.read_csv(summary_path))
+
+    master_table = build_g10_master_comparison_table(comparison_summaries)
+    master_path = Path(output_dir) / "stage2_g10_master_model_ranking.csv"
+    master_table.to_csv(master_path, index=False)
+    return {"master_ranking_csv": master_path}
 
 
 def save_stage2_ml_performance_audit(

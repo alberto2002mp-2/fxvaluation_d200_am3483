@@ -724,6 +724,7 @@ def run_stage2_model(
                 "Error": error,
                 "R2": r2,
                 "Adj_R2": adj_r2,
+                "RMSE": train_rmse,
                 "Train_RMSE": train_rmse,
                 "Validation_RMSE": validation_rmse,
                 "Residual_STD": residual_std,
