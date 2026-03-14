@@ -7,7 +7,6 @@ import sys
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LinearRegression
 
 
 cwd = Path.cwd()
@@ -21,8 +20,8 @@ else:
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-
-from src.data.build_model_ready_data import DEFAULT_PROCESSED_DIR, get_model_ready_data
+from src.data.build_model_ready_data import DEFAULT_PROCESSED_DIR
+from src.stage2_ml_models import run_stage2_model
 
 
 def _compute_days_in_signal(error_z: pd.Series, threshold: float = 2.0) -> pd.Series:
@@ -218,126 +217,17 @@ def run_stage2_fair_value(
     - Applies regime-based re-centering every `recenter_window` days.
     - `return_scale=100.0` matches the project's use of `100 * log-diff`.
     """
-    df = get_model_ready_data(currency, model_type="gbm", processed_dir=processed_dir).copy()
-    df = df.sort_index()
-
-    required_cols = [
-        "Actual_Price",
-        "Log_Return",
-        "driver_1_name",
-        "driver_2_name",
-        "driver_3_name",
-    ]
-    missing = [col for col in required_cols if col not in df.columns]
-    if missing:
-        raise KeyError(f"Missing required columns for Stage 2 run: {missing}")
-
-    if recenter_window <= 0:
-        raise ValueError("recenter_window must be a positive integer.")
-    signal_window = recenter_window if z_window is None else z_window
-    if signal_window <= 0:
-        raise ValueError("z_window must be a positive integer when provided.")
-
-    results = []
-    fv_anchor = float(df["Actual_Price"].iloc[0])
-    last_recenter_i = 0
-
-    for i in range(window, len(df)):
-        current_date = df.index[i]
-        top_names = [
-            df.at[current_date, "driver_1_name"],
-            df.at[current_date, "driver_2_name"],
-            df.at[current_date, "driver_3_name"],
-        ]
-
-        active_drivers = []
-        for name in top_names:
-            if pd.isna(name):
-                continue
-            raw_col = f"{name}_raw"
-            if raw_col in df.columns and pd.notna(df.at[current_date, raw_col]):
-                active_drivers.append(raw_col)
-
-        active_drivers = list(dict.fromkeys(active_drivers))
-        if not active_drivers:
-            continue
-
-        subset_cols = ["Log_Return", *active_drivers]
-        lookback_df = df.iloc[i - window : i].loc[:, subset_cols].dropna()
-        if len(lookback_df) < len(active_drivers) + 2:
-            continue
-
-        X_train = lookback_df[active_drivers]
-        y_train = lookback_df["Log_Return"]
-
-        X_now = df.loc[[current_date], active_drivers]
-        if X_now.isna().any(axis=None):
-            continue
-
-        actual_log_change = df.at[current_date, "Log_Return"]
-        current_price = df.at[current_date, "Actual_Price"]
-        if pd.isna(actual_log_change) or pd.isna(current_price):
-            continue
-
-        recentered = False
-        if (i - last_recenter_i) >= recenter_window:
-            fv_anchor = float(current_price)
-            last_recenter_i = i
-            recentered = True
-
-        model = LinearRegression(fit_intercept=True)
-        model.fit(X_train, y_train)
-
-        pred_log_change = float(model.predict(X_now)[0])
-        fv_anchor = float(fv_anchor * np.exp(pred_log_change / return_scale))
-        error = float(actual_log_change - pred_log_change)
-
-        results.append(
-            {
-                "Date": current_date,
-                "Actual_Price": current_price,
-            "Macro_Anchor_Price": fv_anchor,
-            "Fair_Value_Price": fv_anchor,
-                "Actual_Ret": float(actual_log_change),
-                "Pred_Ret": pred_log_change,
-                "Error": error,
-                "Drivers_Used_Count": len(active_drivers),
-                "Drivers_Used": ", ".join(active_drivers),
-                "Recenter_Event": recentered,
-            }
-        )
-
-    if not results:
-        raise ValueError(f"No Stage 2 results were generated for {currency}.")
-
-    res_df = pd.DataFrame(results).set_index("Date")
-    # Kept for compatibility with existing notebook exploration.
-    res_df["Cum_Error"] = res_df["Error"].ewm(
-        span=error_sum_window,
-        adjust=False,
-        min_periods=error_sum_window,
-    ).mean()
-    res_df["Macro_Gap"] = res_df["Actual_Price"] - res_df["Macro_Anchor_Price"]
-    # Bias-correction technique: periodic re-centering reduces structural model bias
-    # while preserving tactical variance for short-horizon mispricing detection.
-    res_df["Signal_Z"] = (
-        res_df["Macro_Gap"] - res_df["Macro_Gap"].rolling(signal_window).mean()
-    ) / res_df["Macro_Gap"].rolling(signal_window).std()
-    # Compatibility alias for existing downstream workflows.
-    res_df["Error_Z"] = res_df["Signal_Z"]
-    res_df["Signal"] = np.select(
-        [res_df["Signal_Z"] > 2.0, res_df["Signal_Z"] < -2.0],
-        ["SELL", "BUY"],
-        default="NEUTRAL",
+    res_df = run_stage2_model(
+        currency=currency,
+        model_name="ols",
+        window=window,
+        error_sum_window=error_sum_window,
+        z_window=z_window,
+        recenter_window=recenter_window,
+        return_scale=return_scale,
+        processed_dir=processed_dir,
+        start_date=start_date,
     )
-    res_df["Days_In_Signal"] = _compute_days_in_signal(res_df["Signal_Z"], threshold=2.0)
-
-    if start_date is not None:
-        start_date = pd.Timestamp(start_date)
-        res_df = res_df.loc[res_df.index >= start_date].copy()
-
-    if res_df.empty:
-        raise ValueError(f"No Stage 2 results remain for {currency} after start_date filter.")
 
     if show_plot:
         fig = plot_stage2_fair_value_plotly(res_df, currency=currency, start_date=None)

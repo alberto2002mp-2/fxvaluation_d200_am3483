@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 import re
 import sys
-from typing import Dict
+from typing import Any, Dict, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,6 +28,9 @@ if str(project_root) not in sys.path:
 
 DEFAULT_PROCESSED_DIR = project_root / "data" / "processed"
 DEFAULT_AUDIT_DIR = project_root / "data" / "audits"
+
+
+from src.stage2_ml_models import DEFAULT_MODELS, MODEL_LABELS, run_stage2_model_suite
 
 
 def _sanitize_column_name(name: str) -> str:
@@ -91,6 +94,11 @@ def _annualized_sharpe_ratio(daily_returns: pd.Series, periods_per_year: int = 2
     return mean_return / volatility * np.sqrt(periods_per_year)
 
 
+def _rmse(y_true: pd.Series | np.ndarray, y_pred: pd.Series | np.ndarray) -> float:
+    """Return root mean squared error."""
+    return float(np.sqrt(np.mean(np.square(np.asarray(y_true) - np.asarray(y_pred)))))
+
+
 def _largest_beta_driver(row: pd.Series) -> pd.Series:
     """Return the driver with the largest absolute beta on this date."""
     candidates = []
@@ -116,6 +124,51 @@ def _largest_beta_driver(row: pd.Series) -> pd.Series:
             "Largest_Beta_Driver": driver_name,
             "Largest_Beta": beta,
             "Largest_Beta_Abs": abs(beta),
+        }
+    )
+
+
+def _largest_model_attribution(row: pd.Series) -> pd.Series:
+    """Return the dominant attribution for either linear betas or tree SHAP values."""
+    use_shap = False
+    if row.get("Attribution_Method") == "SHAP":
+        use_shap = True
+    else:
+        shap_values = [row.get("Driver_1_SHAP"), row.get("Driver_2_SHAP"), row.get("Driver_3_SHAP")]
+        use_shap = any(pd.notna(value) for value in shap_values)
+
+    value_cols = (
+        ("Driver_1_SHAP", "Driver_2_SHAP", "Driver_3_SHAP")
+        if use_shap
+        else ("Driver_1_Beta", "Driver_2_Beta", "Driver_3_Beta")
+    )
+    method = "SHAP" if use_shap else "BETA"
+
+    candidates = []
+    for idx, value_col in enumerate(value_cols, start=1):
+        name = row.get(f"Driver_{idx}_Name")
+        value = row.get(value_col)
+        if pd.isna(name) or pd.isna(value):
+            continue
+        candidates.append((str(name), float(value)))
+
+    if not candidates:
+        return pd.Series(
+            {
+                "Largest_Attribution_Driver": np.nan,
+                "Largest_Attribution_Value": np.nan,
+                "Largest_Attribution_Abs": np.nan,
+                "Attribution_Method": method,
+            }
+        )
+
+    driver_name, value = max(candidates, key=lambda item: abs(item[1]))
+    return pd.Series(
+        {
+            "Largest_Attribution_Driver": driver_name,
+            "Largest_Attribution_Value": value,
+            "Largest_Attribution_Abs": abs(value),
+            "Attribution_Method": method,
         }
     )
 
@@ -539,6 +592,280 @@ def _plot_strategy_equity_curve(
     plt.close(fig)
 
 
+def prepare_stage2_strategy_audit(
+    stage2_df: pd.DataFrame,
+    forward_days: int = 10,
+    threshold: float = 2.0,
+    sharpe_window: int = 252,
+) -> pd.DataFrame:
+    """Add strategy and audit fields to an existing Stage 2 result frame."""
+    audit_df = stage2_df.copy().sort_index()
+
+    if "Signal_Z" not in audit_df.columns and "Error_Z" in audit_df.columns:
+        audit_df["Signal_Z"] = audit_df["Error_Z"]
+    if "Error_Z" not in audit_df.columns and "Signal_Z" in audit_df.columns:
+        audit_df["Error_Z"] = audit_df["Signal_Z"]
+    if "Signal" not in audit_df.columns:
+        audit_df["Signal"] = np.select(
+            [audit_df["Signal_Z"] > threshold, audit_df["Signal_Z"] < -threshold],
+            ["SELL", "BUY"],
+            default="NEUTRAL",
+        )
+    if "Days_In_Signal" not in audit_df.columns:
+        audit_df["Days_In_Signal"] = _compute_days_in_signal(audit_df["Signal_Z"], threshold=threshold)
+
+    audit_df["Signal_Triggered"] = (audit_df["Signal"] != "NEUTRAL") & (
+        audit_df["Days_In_Signal"] == 1
+    )
+    audit_df["Forward_10d_Return"] = (
+        audit_df["Actual_Price"].shift(-forward_days) / audit_df["Actual_Price"] - 1.0
+    )
+
+    hit_conditions = [
+        (audit_df["Signal"] == "BUY") & (audit_df["Forward_10d_Return"] > 0),
+        (audit_df["Signal"] == "SELL") & (audit_df["Forward_10d_Return"] < 0),
+    ]
+    audit_df["Hit"] = pd.Series(
+        np.select(hit_conditions, [True, True], default=False),
+        index=audit_df.index,
+    ).astype(object)
+    audit_df.loc[audit_df["Signal"] == "NEUTRAL", "Hit"] = np.nan
+    audit_df.loc[audit_df["Forward_10d_Return"].isna(), "Hit"] = np.nan
+
+    attribution_summary = audit_df.apply(_largest_model_attribution, axis=1)
+    audit_df = pd.concat([audit_df, attribution_summary], axis=1)
+
+    daily_returns = audit_df["Actual_Price"].pct_change().fillna(0.0)
+    position_map = {"BUY": 1.0, "SELL": -1.0, "NEUTRAL": 0.0}
+    audit_df["Position"] = audit_df["Signal"].map(position_map).fillna(0.0)
+    audit_df["Strategy_Daily_Return"] = audit_df["Position"].shift(1).fillna(0.0) * daily_returns
+    audit_df["Strategy_Equity_Curve"] = (1.0 + audit_df["Strategy_Daily_Return"]).cumprod()
+
+    rolling_mean = audit_df["Strategy_Daily_Return"].rolling(
+        window=sharpe_window,
+        min_periods=sharpe_window,
+    ).mean()
+    rolling_std = audit_df["Strategy_Daily_Return"].rolling(
+        window=sharpe_window,
+        min_periods=sharpe_window,
+    ).std()
+    audit_df["Rolling_Sharpe"] = (rolling_mean / rolling_std) * np.sqrt(252)
+    audit_df["Strategy_Drawdown"] = (
+        audit_df["Strategy_Equity_Curve"] / audit_df["Strategy_Equity_Curve"].cummax() - 1.0
+    )
+
+    return audit_df
+
+
+def _build_interpretability_hits(audit_df: pd.DataFrame) -> pd.DataFrame:
+    """Return hit-level attribution details for one model."""
+    signal_df = _build_hit_summary(audit_df)
+    hit_df = signal_df.loc[signal_df["Hit"] == True].copy()
+
+    cols = [
+        "Signal",
+        "Forward_10d_Return",
+        "Hit",
+        "Attribution_Method",
+        "Largest_Attribution_Driver",
+        "Largest_Attribution_Value",
+        "Largest_Attribution_Abs",
+        "Driver_1_Name",
+        "Driver_1_Beta",
+        "Driver_1_SHAP",
+        "Driver_2_Name",
+        "Driver_2_Beta",
+        "Driver_2_SHAP",
+        "Driver_3_Name",
+        "Driver_3_Beta",
+        "Driver_3_SHAP",
+    ]
+    out = hit_df.loc[:, [col for col in cols if col in hit_df.columns]].copy()
+    out.index.name = "Date"
+    return out
+
+
+def _summarize_model_audit(
+    model_name: str,
+    currency: str,
+    audit_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Return one comparison-summary row for a model."""
+    signal_df = _build_hit_summary(audit_df)
+    ic_df = audit_df.loc[audit_df["Error_Z"].notna() & audit_df["Forward_10d_Return"].notna()]
+    info_coefficient = (
+        float(ic_df["Error_Z"].corr(ic_df["Forward_10d_Return"]))
+        if len(ic_df) >= 2
+        else np.nan
+    )
+
+    test_rmse = _rmse(audit_df["Actual_Ret"], audit_df["Pred_Ret"])
+    avg_train_rmse = float(audit_df["Train_RMSE"].dropna().mean()) if "Train_RMSE" in audit_df else np.nan
+    avg_validation_rmse = (
+        float(audit_df["Validation_RMSE"].dropna().mean())
+        if "Validation_RMSE" in audit_df and audit_df["Validation_RMSE"].notna().any()
+        else np.nan
+    )
+
+    return {
+        "Currency": currency.upper(),
+        "Model": MODEL_LABELS.get(model_name, model_name.upper()),
+        "Observations": len(audit_df),
+        "Signal_Triggers": len(signal_df),
+        "Hit_Rate_Pct": float(signal_df["Hit"].mean() * 100.0) if not signal_df.empty else np.nan,
+        "Information_Coefficient": info_coefficient,
+        "Sharpe_Ratio": float(_annualized_sharpe_ratio(audit_df["Strategy_Daily_Return"])),
+        "Maximum_Drawdown_Pct": float(_max_drawdown(audit_df["Strategy_Equity_Curve"]) * 100.0),
+        "Strategy_Total_Return_Pct": float((audit_df["Strategy_Equity_Curve"].iloc[-1] - 1.0) * 100.0),
+        "Average_Adj_R2": float(audit_df["Adj_R2"].dropna().mean()) if audit_df["Adj_R2"].notna().any() else np.nan,
+        "Average_Train_RMSE": avg_train_rmse,
+        "Average_Validation_RMSE": avg_validation_rmse,
+        "Test_RMSE": test_rmse,
+        "Generalization_Gap": test_rmse - avg_train_rmse if pd.notna(avg_train_rmse) else np.nan,
+    }
+
+
+def _plot_multi_model_equity_curves(
+    audit_map: Dict[str, pd.DataFrame],
+    currency: str,
+    output_path: str | Path,
+) -> None:
+    """Save a multi-model equity-curve comparison plot."""
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    for model_name, audit_df in audit_map.items():
+        plot_df = audit_df.loc[audit_df["Strategy_Equity_Curve"].notna()]
+        if plot_df.empty:
+            continue
+        ax.plot(
+            plot_df.index,
+            plot_df["Strategy_Equity_Curve"],
+            linewidth=1.4,
+            label=MODEL_LABELS.get(model_name, model_name.upper()),
+        )
+
+    ax.axhline(1.0, color="grey", linestyle=":", linewidth=1.0)
+    ax.set_title(f"{currency.upper()} Stage 2 Multi-Model Equity Curves")
+    ax.set_ylabel("Equity Curve")
+    ax.set_xlabel("Date")
+    ax.legend(loc="best")
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def build_stage2_model_comparison_audit(
+    currency: str,
+    models: Sequence[str] = DEFAULT_MODELS,
+    window: int = 250,
+    error_sum_window: int = 10,
+    z_window: int | None = None,
+    recenter_window: int = 60,
+    forward_days: int = 10,
+    threshold: float = 2.0,
+    return_scale: float = 100.0,
+    sharpe_window: int = 252,
+    cv_splits: int = 4,
+    retune_frequency: int = 60,
+    early_stopping_rounds: int = 25,
+    processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
+    start_date: str | pd.Timestamp | None = None,
+) -> Dict[str, Any]:
+    """Run the full model suite and build the requested comparison audit."""
+    stage2_results = run_stage2_model_suite(
+        currency=currency,
+        models=models,
+        window=window,
+        error_sum_window=error_sum_window,
+        z_window=z_window,
+        recenter_window=recenter_window,
+        return_scale=return_scale,
+        cv_splits=cv_splits,
+        retune_frequency=retune_frequency,
+        early_stopping_rounds=early_stopping_rounds,
+        processed_dir=processed_dir,
+        start_date=start_date,
+    )
+
+    audit_map: Dict[str, pd.DataFrame] = {}
+    summary_rows: list[Dict[str, Any]] = []
+    interpretability_frames: list[pd.DataFrame] = []
+
+    for model_name, model_df in stage2_results.items():
+        audit_df = prepare_stage2_strategy_audit(
+            stage2_df=model_df,
+            forward_days=forward_days,
+            threshold=threshold,
+            sharpe_window=sharpe_window,
+        )
+        audit_map[model_name] = audit_df
+        summary_rows.append(_summarize_model_audit(model_name=model_name, currency=currency, audit_df=audit_df))
+
+        hits_df = _build_interpretability_hits(audit_df)
+        hits_df.insert(0, "Model", MODEL_LABELS.get(model_name, model_name.upper()))
+        interpretability_frames.append(hits_df)
+
+    comparison_summary = pd.DataFrame(summary_rows).sort_values(
+        by=["Generalization_Gap", "Test_RMSE"],
+        ascending=[True, True],
+    )
+    combined_hits = (
+        pd.concat(interpretability_frames, axis=0)
+        if interpretability_frames
+        else pd.DataFrame()
+    )
+
+    return {
+        "comparison_summary": comparison_summary,
+        "audit_map": audit_map,
+        "combined_interpretability_hits": combined_hits,
+    }
+
+
+def save_stage2_model_comparison_audit(
+    currency: str,
+    models: Sequence[str] = DEFAULT_MODELS,
+    output_dir: str | Path = DEFAULT_AUDIT_DIR,
+    **kwargs,
+) -> Dict[str, Path]:
+    """Save the multi-model comparison audit outputs to disk."""
+    audit = build_stage2_model_comparison_audit(
+        currency=currency,
+        models=models,
+        **kwargs,
+    )
+
+    currency_dir = Path(output_dir) / currency.lower()
+    currency_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_path = currency_dir / "stage2_model_comparison_summary.csv"
+    equity_plot_path = currency_dir / "stage2_model_equity_curves.png"
+    hits_path = currency_dir / "stage2_model_interpretability_hits.csv"
+
+    audit["comparison_summary"].to_csv(summary_path, index=False)
+    if not audit["combined_interpretability_hits"].empty:
+        audit["combined_interpretability_hits"].to_csv(hits_path, index=True)
+    _plot_multi_model_equity_curves(
+        audit_map=audit["audit_map"],
+        currency=currency,
+        output_path=equity_plot_path,
+    )
+
+    saved_paths = {
+        "comparison_summary_csv": summary_path,
+        "equity_curve_comparison_png": equity_plot_path,
+    }
+    if not audit["combined_interpretability_hits"].empty:
+        saved_paths["interpretability_hits_csv"] = hits_path
+
+    for model_name, audit_df in audit["audit_map"].items():
+        model_audit_path = currency_dir / f"stage2_{model_name}_audit_dataset.csv"
+        audit_df.to_csv(model_audit_path, index=True)
+        saved_paths[f"{model_name}_audit_dataset_csv"] = model_audit_path
+
+    return saved_paths
+
+
 def save_stage2_ml_performance_audit(
     currency: str,
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
@@ -582,6 +909,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     """Create a CLI for the Stage 2 ML performance audit."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("currency", help="Currency code, for example eur or gbp.")
+    parser.add_argument(
+        "--compare-models",
+        action="store_true",
+        help="Run the multi-model comparison audit instead of the single OLS baseline audit.",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=list(DEFAULT_MODELS),
+        help="Model names to include in the multi-model comparison audit.",
+    )
     parser.add_argument("--window", type=int, default=50, help="Rolling training window.")
     parser.add_argument(
         "--error-sum-window",
@@ -626,6 +964,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Rolling window used for the rolling Sharpe ratio series.",
     )
     parser.add_argument(
+        "--cv-splits",
+        type=int,
+        default=4,
+        help="TimeSeriesSplit folds used by the regularized and tree models.",
+    )
+    parser.add_argument(
+        "--retune-frequency",
+        type=int,
+        default=60,
+        help="Days between hyperparameter retunes in the walk-forward loop.",
+    )
+    parser.add_argument(
+        "--early-stopping-rounds",
+        type=int,
+        default=25,
+        help="Early stopping rounds for the tree models.",
+    )
+    parser.add_argument(
         "--processed-dir",
         default=DEFAULT_PROCESSED_DIR,
         help="Directory containing the saved master CSVs.",
@@ -648,23 +1004,45 @@ def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    output_paths = save_stage2_ml_performance_audit(
-        currency=args.currency,
-        window=args.window,
-        error_sum_window=args.error_sum_window,
-        z_window=args.z_window,
-        recenter_window=args.recenter_window,
-        forward_days=args.forward_days,
-        threshold=args.threshold,
-        return_scale=args.return_scale,
-        sharpe_window=args.sharpe_window,
-        processed_dir=args.processed_dir,
-        output_dir=args.output_dir,
-        start_date=args.start_date,
-    )
+    if args.compare_models:
+        output_paths = save_stage2_model_comparison_audit(
+            currency=args.currency,
+            models=args.models,
+            window=args.window,
+            error_sum_window=args.error_sum_window,
+            z_window=args.z_window,
+            recenter_window=args.recenter_window,
+            forward_days=args.forward_days,
+            threshold=args.threshold,
+            return_scale=args.return_scale,
+            sharpe_window=args.sharpe_window,
+            cv_splits=args.cv_splits,
+            retune_frequency=args.retune_frequency,
+            early_stopping_rounds=args.early_stopping_rounds,
+            processed_dir=args.processed_dir,
+            output_dir=args.output_dir,
+            start_date=args.start_date,
+        )
+        summary_df = pd.read_csv(output_paths["comparison_summary_csv"])
+        print("\nStage 2 Multi-Model Comparison Audit")
+    else:
+        output_paths = save_stage2_ml_performance_audit(
+            currency=args.currency,
+            window=args.window,
+            error_sum_window=args.error_sum_window,
+            z_window=args.z_window,
+            recenter_window=args.recenter_window,
+            forward_days=args.forward_days,
+            threshold=args.threshold,
+            return_scale=args.return_scale,
+            sharpe_window=args.sharpe_window,
+            processed_dir=args.processed_dir,
+            output_dir=args.output_dir,
+            start_date=args.start_date,
+        )
+        summary_df = pd.read_csv(output_paths["summary_csv"])
+        print("\nStage 2 Machine Learning Performance Audit")
 
-    summary_df = pd.read_csv(output_paths["summary_csv"])
-    print("\nStage 2 Machine Learning Performance Audit")
     print(summary_df.to_string(index=False))
     print("\nSaved outputs:")
     for label, path in output_paths.items():
