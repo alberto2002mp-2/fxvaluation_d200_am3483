@@ -13,7 +13,16 @@ from typing import Any, Dict, Iterable, Sequence
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import ElasticNet, ElasticNetCV, Lasso, LassoCV, LinearRegression, Ridge, RidgeCV
+from sklearn.linear_model import (
+    ElasticNet,
+    ElasticNetCV,
+    Lasso,
+    LassoCV,
+    LinearRegression,
+    Ridge,
+    RidgeCV,
+    SGDRegressor,
+)
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from xgboost import DMatrix, XGBRegressor
@@ -33,27 +42,37 @@ if str(project_root) not in sys.path:
 
 DEFAULT_PROCESSED_DIR = project_root / "data" / "processed"
 DEFAULT_OUTPUT_DIR = project_root / "data" / "model_outputs"
-DEFAULT_MODELS = ("ols", "ridge", "lasso", "elasticnet", "xgb", "lgbm")
-LINEAR_MODELS = {"ols", "ridge", "lasso", "elasticnet"}
+DEFAULT_MODELS = ("ols", "ridge", "lasso", "elasticnet", "sgd", "xgb", "lgbm", "stacked")
+LINEAR_MODELS = {"ols", "ridge", "lasso", "elasticnet", "sgd"}
+REGULARIZED_MODELS = {"ridge", "lasso", "elasticnet", "sgd"}
 TREE_MODELS = {"xgb", "lgbm"}
+STACKING_BASE_MODELS = ("elasticnet", "xgb", "lgbm")
 MODEL_LABELS = {
     "ols": "OLS",
     "ridge": "RidgeCV",
     "lasso": "LassoCV",
     "elasticnet": "ElasticNetCV",
+    "sgd": "SGDRegressor",
     "xgb": "XGBRegressor",
     "lgbm": "LGBMRegressor",
+    "stacked": "StackedEnsemble",
 }
 MODEL_FEATURE_SUFFIX = {
     "ols": "raw",
     "ridge": "std",
     "lasso": "std",
     "elasticnet": "std",
+    "sgd": "std",
     "xgb": "raw",
     "lgbm": "raw",
+    "stacked": "stacked",
 }
 LINEAR_ALPHA_GRID = np.logspace(-4, 2, 12)
 ELASTICNET_L1_GRID = (0.1, 0.3, 0.5, 0.7, 0.9)
+SGD_ALPHA_GRID = np.logspace(-5, -2, 4)
+SGD_L1_GRID = (0.15, 0.5, 0.85)
+SGD_ETA0 = 0.01
+SGD_MAX_EPOCHS = 150
 TREE_PARAM_GRID = {
     "n_estimators": (200, 400),
     "max_depth": (2, 3),
@@ -279,6 +298,17 @@ def _iter_tree_param_grid() -> Iterable[Dict[str, Any]]:
         yield dict(zip(keys, values))
 
 
+def _iter_sgd_param_grid() -> Iterable[Dict[str, Any]]:
+    """Yield SGD hyperparameter combinations."""
+    for alpha, l1_ratio in product(SGD_ALPHA_GRID, SGD_L1_GRID):
+        yield {
+            "alpha": float(alpha),
+            "l1_ratio": float(l1_ratio),
+            "eta0": float(SGD_ETA0),
+            "max_epochs": int(SGD_MAX_EPOCHS),
+        }
+
+
 def _split_train_eval(
     x_train: pd.DataFrame,
     y_train: pd.Series,
@@ -336,6 +366,43 @@ def _build_tree_model(
             **common_params,
         )
     raise ValueError(f"{model_name} is not a tree model.")
+
+
+def _fit_sgd_model(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    params: Dict[str, Any],
+    random_state: int = 42,
+    return_loss_curve: bool = False,
+) -> tuple[SGDRegressor, list[float]]:
+    """Fit SGDRegressor manually with epoch-by-epoch loss logging."""
+    model = SGDRegressor(
+        loss="squared_error",
+        penalty="elasticnet",
+        alpha=float(params["alpha"]),
+        l1_ratio=float(params["l1_ratio"]),
+        learning_rate="adaptive",
+        eta0=float(params.get("eta0", SGD_ETA0)),
+        fit_intercept=True,
+        max_iter=1,
+        tol=None,
+        shuffle=False,
+        random_state=random_state,
+        warm_start=True,
+        average=True,
+    )
+
+    x_values = x_train.astype(float)
+    y_values = y_train.astype(float)
+    loss_curve: list[float] = []
+
+    for _ in range(int(params.get("max_epochs", SGD_MAX_EPOCHS))):
+        model.partial_fit(x_values, y_values)
+        if return_loss_curve:
+            train_pred = model.predict(x_values)
+            loss_curve.append(_rmse(y_values, train_pred))
+
+    return model, loss_curve
 
 
 def _fit_tree_model(
@@ -431,6 +498,50 @@ def _tune_tree_model(
     return best_params, best_score
 
 
+def _tune_sgd_model(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    cv_splits: int,
+    random_state: int = 42,
+) -> tuple[Dict[str, Any], float]:
+    """Tune SGDRegressor with time-series validation."""
+    cv = _effective_tscv(len(x_train), cv_splits)
+    if cv is None:
+        params = next(iter(_iter_sgd_param_grid()))
+        return params, np.nan
+
+    best_params: Dict[str, Any] | None = None
+    best_score = np.inf
+
+    for params in _iter_sgd_param_grid():
+        fold_scores: list[float] = []
+        for fold_train_idx, fold_val_idx in cv.split(x_train):
+            x_fold_train = x_train.iloc[fold_train_idx]
+            y_fold_train = y_train.iloc[fold_train_idx]
+            x_fold_val = x_train.iloc[fold_val_idx]
+            y_fold_val = y_train.iloc[fold_val_idx]
+
+            model, _ = _fit_sgd_model(
+                x_train=x_fold_train,
+                y_train=y_fold_train,
+                params=params,
+                random_state=random_state,
+                return_loss_curve=False,
+            )
+            pred_val = model.predict(x_fold_val)
+            fold_scores.append(_rmse(y_fold_val, pred_val))
+
+        score = float(np.mean(fold_scores)) if fold_scores else np.inf
+        if score < best_score:
+            best_score = score
+            best_params = params
+
+    if best_params is None:
+        best_params = next(iter(_iter_sgd_param_grid()))
+        best_score = np.nan
+    return best_params, best_score
+
+
 def _fit_final_model(
     model_name: str,
     x_train: pd.DataFrame,
@@ -468,6 +579,15 @@ def _fit_final_model(
         )
         model.fit(x_train, y_train)
         return model
+    if model_name == "sgd":
+        model, _ = _fit_sgd_model(
+            x_train=x_train,
+            y_train=y_train,
+            params=params,
+            random_state=random_state,
+            return_loss_curve=False,
+        )
+        return model
     if model_name in TREE_MODELS:
         return _fit_tree_model(
             model_name=model_name,
@@ -503,6 +623,13 @@ def _select_model_params(
     if model_name in {"ridge", "lasso", "elasticnet"}:
         return _tune_linear_model(
             model_name=model_name,
+            x_train=x_train,
+            y_train=y_train,
+            cv_splits=cv_splits,
+            random_state=random_state,
+        )
+    if model_name == "sgd":
+        return _tune_sgd_model(
             x_train=x_train,
             y_train=y_train,
             cv_splits=cv_splits,
@@ -570,6 +697,244 @@ def _model_intercept_value(model) -> float:
     return float(intercept[0])
 
 
+def _feature_columns_for_names(active_names: Sequence[str], feature_suffix: str) -> list[str]:
+    """Return sanitized feature columns for the supplied driver names."""
+    return [f"{_sanitize_column_name(name)}_{feature_suffix}" for name in active_names]
+
+
+def _build_stacked_inputs(
+    df: pd.DataFrame,
+    current_date: pd.Timestamp,
+    window: int,
+) -> tuple[list[str], pd.DataFrame, dict[str, pd.DataFrame]] | None:
+    """Return aligned training and current-step inputs for the stacked ensemble."""
+    top_names = [
+        df.at[current_date, "driver_1_name"],
+        df.at[current_date, "driver_2_name"],
+        df.at[current_date, "driver_3_name"],
+    ]
+
+    active_names: list[str] = []
+    for name in top_names:
+        if pd.isna(name):
+            continue
+        raw_col = f"{_sanitize_column_name(str(name))}_raw"
+        std_col = f"{_sanitize_column_name(str(name))}_std"
+        if (
+            raw_col in df.columns
+            and std_col in df.columns
+            and pd.notna(df.at[current_date, raw_col])
+            and pd.notna(df.at[current_date, std_col])
+            and str(name) not in active_names
+        ):
+            active_names.append(str(name))
+
+    if not active_names:
+        return None
+
+    raw_cols = _feature_columns_for_names(active_names, "raw")
+    std_cols = _feature_columns_for_names(active_names, "std")
+    combined_cols = ["Log_Return", *raw_cols, *std_cols]
+    lookback_df = df.iloc[df.index.get_loc(current_date) - window : df.index.get_loc(current_date)].loc[:, combined_cols].dropna()
+    if len(lookback_df) < len(active_names) + 20:
+        return None
+
+    current_inputs = {
+        "elasticnet": df.loc[[current_date], std_cols],
+        "xgb": df.loc[[current_date], raw_cols],
+        "lgbm": df.loc[[current_date], raw_cols],
+    }
+    if any(frame.isna().any(axis=None) for frame in current_inputs.values()):
+        return None
+
+    return active_names, lookback_df, current_inputs
+
+
+def _build_stacked_oof_features(
+    base_train_map: Dict[str, pd.DataFrame],
+    y_train: pd.Series,
+    base_params_map: Dict[str, Dict[str, Any]],
+    cv_splits: int,
+    random_state: int = 42,
+    early_stopping_rounds: int = 25,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Build out-of-fold base-model predictions for the meta-model."""
+    cv = _effective_tscv(len(y_train), cv_splits)
+    if cv is None:
+        return pd.DataFrame(), pd.Series(dtype=float)
+
+    meta_feature_names = [MODEL_LABELS[model_name] for model_name in STACKING_BASE_MODELS]
+    meta_features = pd.DataFrame(index=y_train.index, columns=meta_feature_names, dtype=float)
+
+    for fold_train_idx, fold_val_idx in cv.split(y_train):
+        y_fold_train = y_train.iloc[fold_train_idx]
+        for base_model in STACKING_BASE_MODELS:
+            x_fold_train = base_train_map[base_model].iloc[fold_train_idx]
+            x_fold_val = base_train_map[base_model].iloc[fold_val_idx]
+            y_fold_val = y_train.iloc[fold_val_idx]
+            eval_set = (x_fold_val, y_fold_val) if base_model in TREE_MODELS else None
+            model = _fit_final_model(
+                model_name=base_model,
+                x_train=x_fold_train,
+                y_train=y_fold_train,
+                params=base_params_map[base_model],
+                random_state=random_state,
+                early_stopping_rounds=early_stopping_rounds,
+                eval_set=eval_set,
+            )
+            meta_features.iloc[fold_val_idx, meta_feature_names.index(MODEL_LABELS[base_model])] = model.predict(x_fold_val)
+
+    meta_features = meta_features.dropna()
+    return meta_features, y_train.loc[meta_features.index]
+
+
+def _fit_stacked_meta_model(
+    meta_x: pd.DataFrame,
+    meta_y: pd.Series,
+    cv_splits: int,
+) -> tuple[Ridge, float]:
+    """Fit the Ridge meta-model and return the chosen alpha."""
+    meta_cv = _effective_tscv(len(meta_x), min(cv_splits, 3))
+    if meta_cv is None:
+        model = Ridge(alpha=1.0, fit_intercept=True)
+        model.fit(meta_x, meta_y)
+        return model, 1.0
+
+    tuner = RidgeCV(
+        alphas=LINEAR_ALPHA_GRID,
+        fit_intercept=True,
+        scoring="neg_mean_squared_error",
+        cv=meta_cv,
+    )
+    tuner.fit(meta_x, meta_y)
+    model = Ridge(alpha=float(tuner.alpha_), fit_intercept=True)
+    model.fit(meta_x, meta_y)
+    return model, float(tuner.alpha_)
+
+
+def _tune_stacked_model(
+    lookback_df: pd.DataFrame,
+    active_names: Sequence[str],
+    cv_splits: int,
+    random_state: int = 42,
+    early_stopping_rounds: int = 25,
+) -> tuple[Dict[str, Any], float]:
+    """Tune stacked base models and the Ridge meta-model."""
+    y_train = lookback_df["Log_Return"]
+    base_train_map = {
+        "elasticnet": lookback_df[_feature_columns_for_names(active_names, "std")],
+        "xgb": lookback_df[_feature_columns_for_names(active_names, "raw")],
+        "lgbm": lookback_df[_feature_columns_for_names(active_names, "raw")],
+    }
+
+    base_params_map: Dict[str, Dict[str, Any]] = {}
+    for base_model in STACKING_BASE_MODELS:
+        params, _ = _select_model_params(
+            model_name=base_model,
+            x_train=base_train_map[base_model],
+            y_train=y_train,
+            cv_splits=cv_splits,
+            random_state=random_state,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+        base_params_map[base_model] = params
+
+    meta_x, meta_y = _build_stacked_oof_features(
+        base_train_map=base_train_map,
+        y_train=y_train,
+        base_params_map=base_params_map,
+        cv_splits=cv_splits,
+        random_state=random_state,
+        early_stopping_rounds=early_stopping_rounds,
+    )
+    if meta_x.empty:
+        return {"base_models": base_params_map, "meta_alpha": 1.0}, np.nan
+
+    meta_model, meta_alpha = _fit_stacked_meta_model(meta_x=meta_x, meta_y=meta_y, cv_splits=cv_splits)
+    validation_rmse = _rmse(meta_y, meta_model.predict(meta_x))
+    return {"base_models": base_params_map, "meta_alpha": meta_alpha}, validation_rmse
+
+
+def _fit_stacked_models(
+    lookback_df: pd.DataFrame,
+    current_inputs: Dict[str, pd.DataFrame],
+    active_names: Sequence[str],
+    params: Dict[str, Any],
+    cv_splits: int,
+    random_state: int = 42,
+    early_stopping_rounds: int = 25,
+) -> Dict[str, Any]:
+    """Fit the stacked ensemble for one walk-forward step."""
+    y_train = lookback_df["Log_Return"]
+    base_train_map = {
+        "elasticnet": lookback_df[_feature_columns_for_names(active_names, "std")],
+        "xgb": lookback_df[_feature_columns_for_names(active_names, "raw")],
+        "lgbm": lookback_df[_feature_columns_for_names(active_names, "raw")],
+    }
+    base_params_map = params["base_models"]
+
+    meta_x, meta_y = _build_stacked_oof_features(
+        base_train_map=base_train_map,
+        y_train=y_train,
+        base_params_map=base_params_map,
+        cv_splits=cv_splits,
+        random_state=random_state,
+        early_stopping_rounds=early_stopping_rounds,
+    )
+    if meta_x.empty:
+        raise ValueError("Stacked ensemble could not build meta-features for the current window.")
+
+    meta_model = Ridge(alpha=float(params.get("meta_alpha", 1.0)), fit_intercept=True)
+    meta_model.fit(meta_x, meta_y)
+
+    fitted_base_models: Dict[str, Any] = {}
+    full_train_preds: Dict[str, np.ndarray] = {}
+    current_meta_row: Dict[str, float] = {}
+    for base_model in STACKING_BASE_MODELS:
+        eval_set = None
+        if base_model in TREE_MODELS:
+            x_fit = base_train_map[base_model]
+            y_fit = y_train
+            x_eval, y_eval = _split_train_eval(x_fit, y_fit)[2:]
+            if x_eval is not None and y_eval is not None:
+                eval_set = (x_eval, y_eval)
+            else:
+                eval_set = None
+        model = _fit_final_model(
+            model_name=base_model,
+            x_train=base_train_map[base_model],
+            y_train=y_train,
+            params=base_params_map[base_model],
+            random_state=random_state,
+            early_stopping_rounds=early_stopping_rounds,
+            eval_set=eval_set,
+        )
+        fitted_base_models[base_model] = model
+        label = MODEL_LABELS[base_model]
+        full_train_preds[label] = model.predict(base_train_map[base_model])
+        current_meta_row[label] = float(model.predict(current_inputs[base_model])[0])
+
+    full_meta_x = pd.DataFrame(full_train_preds, index=y_train.index)
+    train_pred = meta_model.predict(full_meta_x)
+    current_pred = float(meta_model.predict(pd.DataFrame([current_meta_row], index=current_inputs["elasticnet"].index))[0])
+
+    meta_coefs = np.asarray(meta_model.coef_).reshape(-1)
+    meta_weights = {
+        "ElasticNetCV": float(meta_coefs[0]) if len(meta_coefs) > 0 else np.nan,
+        "XGBRegressor": float(meta_coefs[1]) if len(meta_coefs) > 1 else np.nan,
+        "LGBMRegressor": float(meta_coefs[2]) if len(meta_coefs) > 2 else np.nan,
+    }
+
+    return {
+        "pred_now": current_pred,
+        "train_pred": train_pred,
+        "train_y": y_train,
+        "meta_model": meta_model,
+        "meta_weights": meta_weights,
+        "validation_rmse": _rmse(meta_y, meta_model.predict(meta_x)),
+    }
+
+
 def run_stage2_model(
     currency: str,
     model_name: str = "ols",
@@ -612,32 +977,57 @@ def run_stage2_model(
 
     for i in range(window, len(df)):
         current_date = df.index[i]
-        active_names, active_cols = _active_feature_names(
-            df=df,
-            current_date=current_date,
-            feature_suffix=feature_suffix,
-        )
-        if not active_cols:
-            continue
+        stacked_bundle = None
+        if model_name == "stacked":
+            stacked_bundle = _build_stacked_inputs(df=df, current_date=current_date, window=window)
+            if stacked_bundle is None:
+                continue
+            active_names, lookback_df, current_inputs = stacked_bundle
+            active_cols = []
+            x_train = pd.DataFrame(index=lookback_df.index)
+            y_train = lookback_df["Log_Return"]
+            x_now = pd.DataFrame(index=[current_date])
+        else:
+            active_names, active_cols = _active_feature_names(
+                df=df,
+                current_date=current_date,
+                feature_suffix=feature_suffix,
+            )
+            if not active_cols:
+                continue
 
-        subset_cols = ["Log_Return", *active_cols]
-        lookback_df = df.iloc[i - window : i].loc[:, subset_cols].dropna()
-        if len(lookback_df) < len(active_cols) + 20:
-            continue
+            subset_cols = ["Log_Return", *active_cols]
+            lookback_df = df.iloc[i - window : i].loc[:, subset_cols].dropna()
+            if len(lookback_df) < len(active_cols) + 20:
+                continue
 
-        x_train = lookback_df[active_cols]
-        y_train = lookback_df["Log_Return"]
-        x_now = df.loc[[current_date], active_cols]
+            x_train = lookback_df[active_cols]
+            y_train = lookback_df["Log_Return"]
+            x_now = df.loc[[current_date], active_cols]
 
-        if x_now.isna().any(axis=None):
-            continue
+            if x_now.isna().any(axis=None):
+                continue
 
         actual_log_change = df.at[current_date, "Log_Return"]
         current_price = df.at[current_date, "Actual_Price"]
         if pd.isna(actual_log_change) or pd.isna(current_price):
             continue
 
-        if model_name != "ols":
+        if model_name == "stacked":
+            should_retune = last_tuned_i is None or (i - last_tuned_i) >= retune_frequency
+            if should_retune:
+                selected_params, validation_rmse = _tune_stacked_model(
+                    lookback_df=lookback_df,
+                    active_names=active_names,
+                    cv_splits=cv_splits,
+                    random_state=random_state,
+                    early_stopping_rounds=early_stopping_rounds,
+                )
+                last_tuned_i = i
+                retuned = True
+            else:
+                retuned = False
+        elif model_name != "ols":
             should_retune = last_tuned_i is None or (i - last_tuned_i) >= retune_frequency
             if should_retune:
                 selected_params, validation_rmse = _select_model_params(
@@ -669,31 +1059,74 @@ def run_stage2_model(
             last_recenter_i = i
             recentered = True
 
-        model = _fit_final_model(
-            model_name=model_name,
-            x_train=x_train,
-            y_train=y_train,
-            params=selected_params,
-            random_state=random_state,
-            early_stopping_rounds=early_stopping_rounds,
-        )
+        loss_curve: list[float] = []
+        meta_alpha = np.nan
+        if model_name == "stacked":
+            stacked_result = _fit_stacked_models(
+                lookback_df=lookback_df,
+                current_inputs=current_inputs,
+                active_names=active_names,
+                params=selected_params,
+                cv_splits=cv_splits,
+                random_state=random_state,
+                early_stopping_rounds=early_stopping_rounds,
+            )
+            pred_log_change = stacked_result["pred_now"]
+            fitted_train = stacked_result["train_pred"]
+            y_metric = stacked_result["train_y"]
+            validation_rmse = stacked_result["validation_rmse"]
+            model = stacked_result["meta_model"]
+            meta_alpha = float(selected_params.get("meta_alpha", np.nan))
+        elif model_name == "sgd":
+            model, loss_curve = _fit_sgd_model(
+                x_train=x_train,
+                y_train=y_train,
+                params=selected_params,
+                random_state=random_state,
+                return_loss_curve=True,
+            )
+            pred_log_change = float(model.predict(x_now)[0])
+            fitted_train = model.predict(x_train)
+            y_metric = y_train
+        else:
+            model = _fit_final_model(
+                model_name=model_name,
+                x_train=x_train,
+                y_train=y_train,
+                params=selected_params,
+                random_state=random_state,
+                early_stopping_rounds=early_stopping_rounds,
+            )
+            pred_log_change = float(model.predict(x_now)[0])
+            fitted_train = model.predict(x_train)
+            y_metric = y_train
 
-        pred_log_change = float(model.predict(x_now)[0])
         fv_anchor = float(fv_anchor * np.exp(pred_log_change / return_scale))
         error = float(actual_log_change - pred_log_change)
 
-        fitted_train = model.predict(x_train)
-        residuals = y_train - fitted_train
-        n_obs = len(x_train)
-        n_features = len(active_cols)
-        r2 = float(model.score(x_train, y_train))
+        residuals = y_metric - fitted_train
+        n_obs = len(y_metric)
+        n_features = len(active_cols) if model_name != "stacked" else len(STACKING_BASE_MODELS)
+        if model_name == "stacked":
+            ss_res = float(np.sum(np.square(np.asarray(y_metric) - np.asarray(fitted_train))))
+            ss_tot = float(np.sum(np.square(np.asarray(y_metric) - float(np.mean(y_metric)))))
+            r2 = float(1 - (ss_res / ss_tot)) if not np.isclose(ss_tot, 0.0) else np.nan
+        else:
+            r2 = float(model.score(x_train, y_train))
         adj_r2 = _adjusted_r2(r2, n_obs, n_features)
-        train_rmse = _rmse(y_train, fitted_train)
+        train_rmse = _rmse(y_metric, fitted_train)
         residual_std = float(pd.Series(residuals).std(ddof=1)) if len(residuals) > 1 else np.nan
 
         linear_values: Dict[str, float] = {}
         shap_values: Dict[str, float] = {}
-        if hasattr(model, "coef_"):
+        if model_name == "stacked":
+            linear_values = {
+                f"{_sanitize_column_name('ElasticNetCV')}_stacked": stacked_result["meta_weights"]["ElasticNetCV"],
+                f"{_sanitize_column_name('XGBRegressor')}_stacked": stacked_result["meta_weights"]["XGBRegressor"],
+                f"{_sanitize_column_name('LGBMRegressor')}_stacked": stacked_result["meta_weights"]["LGBMRegressor"],
+            }
+            active_names = ["ElasticNetCV", "XGBRegressor", "LGBMRegressor"]
+        elif hasattr(model, "coef_"):
             linear_values = {
                 feature_name: float(beta)
                 for feature_name, beta in zip(active_cols, np.asarray(model.coef_))
@@ -704,7 +1137,7 @@ def run_stage2_model(
         driver_names, beta_values = _pad_driver_values(
             active_names=active_names,
             values_by_feature=linear_values,
-            feature_suffix=feature_suffix,
+            feature_suffix=feature_suffix if model_name != "stacked" else "stacked",
         )
         _, shap_contribs = _pad_driver_values(
             active_names=active_names,
@@ -741,7 +1174,9 @@ def run_stage2_model(
                 "Driver_1_SHAP": shap_contribs[0],
                 "Driver_2_SHAP": shap_contribs[1],
                 "Driver_3_SHAP": shap_contribs[2],
-                "Attribution_Method": "SHAP" if model_name in TREE_MODELS else "BETA",
+                "Attribution_Method": (
+                    "STACK" if model_name == "stacked" else "SHAP" if model_name in TREE_MODELS else "BETA"
+                ),
                 "Best_Params": json.dumps(selected_params, sort_keys=True),
                 "Alpha": float(selected_params["alpha"]) if "alpha" in selected_params else np.nan,
                 "L1_Ratio": float(selected_params["l1_ratio"]) if "l1_ratio" in selected_params else np.nan,
@@ -757,6 +1192,10 @@ def run_stage2_model(
                 "Subsample": float(selected_params["subsample"])
                 if "subsample" in selected_params
                 else np.nan,
+                "Meta_Alpha": meta_alpha,
+                "Loss_Curve": json.dumps(loss_curve) if loss_curve else "",
+                "Final_Loss": float(loss_curve[-1]) if loss_curve else np.nan,
+                "Epochs_Trained": len(loss_curve) if loss_curve else np.nan,
                 "Retuned": retuned,
                 "Recenter_Event": recentered,
             }

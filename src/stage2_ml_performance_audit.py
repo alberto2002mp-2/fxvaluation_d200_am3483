@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import re
 import sys
@@ -143,7 +144,7 @@ def _largest_model_attribution(row: pd.Series) -> pd.Series:
         if use_shap
         else ("Driver_1_Beta", "Driver_2_Beta", "Driver_3_Beta")
     )
-    method = "SHAP" if use_shap else "BETA"
+    method = "SHAP" if use_shap else str(row.get("Attribution_Method", "BETA"))
 
     candidates = []
     for idx, value_col in enumerate(value_cols, start=1):
@@ -159,7 +160,7 @@ def _largest_model_attribution(row: pd.Series) -> pd.Series:
                 "Largest_Attribution_Driver": np.nan,
                 "Largest_Attribution_Value": np.nan,
                 "Largest_Attribution_Abs": np.nan,
-                "Attribution_Method": method,
+                "Dominant_Attribution_Method": method,
             }
         )
 
@@ -169,7 +170,7 @@ def _largest_model_attribution(row: pd.Series) -> pd.Series:
             "Largest_Attribution_Driver": driver_name,
             "Largest_Attribution_Value": value,
             "Largest_Attribution_Abs": abs(value),
-            "Attribution_Method": method,
+            "Dominant_Attribution_Method": method,
         }
     )
 
@@ -668,6 +669,7 @@ def _build_interpretability_hits(audit_df: pd.DataFrame) -> pd.DataFrame:
         "Forward_10d_Return",
         "Hit",
         "Attribution_Method",
+        "Dominant_Attribution_Method",
         "Largest_Attribution_Driver",
         "Largest_Attribution_Value",
         "Largest_Attribution_Abs",
@@ -707,6 +709,9 @@ def _best_tuning_event(audit_df: pd.DataFrame) -> Dict[str, Any]:
         "Best_Alpha": float(best_row["Alpha"]) if pd.notna(best_row.get("Alpha")) else np.nan,
         "Best_L1_Ratio": float(best_row["L1_Ratio"])
         if pd.notna(best_row.get("L1_Ratio"))
+        else np.nan,
+        "Best_Meta_Alpha": float(best_row["Meta_Alpha"])
+        if pd.notna(best_row.get("Meta_Alpha"))
         else np.nan,
         "Best_N_Estimators": int(best_row["N_Estimators"])
         if pd.notna(best_row.get("N_Estimators"))
@@ -764,6 +769,41 @@ def _summarize_model_audit(
     }
     row.update(tuning_summary)
     return row
+
+
+def _plot_sgd_loss_curve(
+    audit_df: pd.DataFrame,
+    currency: str,
+    output_path: str | Path,
+) -> None:
+    """Save the best logged SGD loss curve for one currency."""
+    if "Loss_Curve" not in audit_df.columns:
+        return
+
+    curve_df = audit_df.loc[audit_df["Loss_Curve"].astype(str).str.len() > 2].copy()
+    if curve_df.empty:
+        return
+
+    if "Validation_RMSE" in curve_df.columns and curve_df["Validation_RMSE"].notna().any():
+        row = curve_df.sort_values(by="Validation_RMSE", ascending=True).iloc[0]
+    else:
+        row = curve_df.iloc[0]
+
+    try:
+        loss_curve = json.loads(str(row["Loss_Curve"]))
+    except json.JSONDecodeError:
+        return
+    if not loss_curve:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    ax.plot(range(1, len(loss_curve) + 1), loss_curve, color="tab:orange", linewidth=1.5)
+    ax.set_title(f"{currency.upper()} SGD Loss Curve")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Training RMSE")
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _plot_multi_model_equity_curves(
@@ -916,6 +956,7 @@ def save_stage2_model_comparison_audit(
         model_audit_path = currency_dir / f"stage2_{model_name}_audit_dataset.csv"
         model_generalization_path = currency_dir / f"stage2_{model_name}_generalization_metrics.png"
         model_equity_path = currency_dir / f"stage2_{model_name}_strategy_equity_curve.png"
+        model_loss_curve_path = currency_dir / f"stage2_{model_name}_loss_curve.png"
         audit_df.to_csv(model_audit_path, index=True)
         _plot_generalization_metrics(
             audit_df=audit_df,
@@ -927,11 +968,143 @@ def save_stage2_model_comparison_audit(
             currency=f"{currency.upper()} {MODEL_LABELS.get(model_name, model_name.upper())}",
             output_path=model_equity_path,
         )
+        if model_name == "sgd":
+            _plot_sgd_loss_curve(
+                audit_df=audit_df,
+                currency=currency,
+                output_path=model_loss_curve_path,
+            )
         saved_paths[f"{model_name}_audit_dataset_csv"] = model_audit_path
         saved_paths[f"{model_name}_generalization_plot_png"] = model_generalization_path
         saved_paths[f"{model_name}_equity_curve_png"] = model_equity_path
+        if model_name == "sgd":
+            saved_paths[f"{model_name}_loss_curve_png"] = model_loss_curve_path
 
     return saved_paths
+
+
+def _driver_theme(driver_name: str) -> str:
+    """Map a driver name into a broad macro theme."""
+    lower = driver_name.lower()
+    if "yield" in lower or "ois" in lower or "forward" in lower:
+        return "Yields"
+    if any(token in lower for token in ("gold", "oil", "copper", "bcom", "ng1", "comdty")):
+        return "Commodities"
+    if any(token in lower for token in ("msci", "s&p", "wilshire", "dow jones", "index")):
+        return "Equities/Risk"
+    if any(token in lower for token in ("bbdxy", "emfx", "asia emfx")):
+        return "FX Broad Indices"
+    if any(token in lower for token in ("vix", "move", "jpmvg")):
+        return "Volatility"
+    return "Other"
+
+
+def build_g10_shap_summary(
+    currencies: Sequence[str] = DEFAULT_CURRENCIES,
+    output_dir: str | Path = DEFAULT_AUDIT_DIR,
+    models: Sequence[str] = ("xgb", "lgbm"),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Aggregate SHAP contributions across the G10 universe."""
+    rows: list[Dict[str, Any]] = []
+    for currency in currencies:
+        currency_dir = Path(output_dir) / currency.lower()
+        for model_name in models:
+            csv_path = currency_dir / f"stage2_{model_name}_audit_dataset.csv"
+            if not csv_path.exists():
+                continue
+            df = pd.read_csv(csv_path)
+            for idx in range(1, 4):
+                name_col = f"Driver_{idx}_Name"
+                shap_col = f"Driver_{idx}_SHAP"
+                if name_col not in df.columns or shap_col not in df.columns:
+                    continue
+                subset = df[[name_col, shap_col]].dropna()
+                for _, row in subset.iterrows():
+                    driver_name = str(row[name_col])
+                    shap_value = float(row[shap_col])
+                    rows.append(
+                        {
+                            "Currency": currency.upper(),
+                            "Model": MODEL_LABELS.get(model_name, model_name.upper()),
+                            "Driver": driver_name,
+                            "Theme": _driver_theme(driver_name),
+                            "SHAP_Value": shap_value,
+                            "Abs_SHAP_Value": abs(shap_value),
+                        }
+                    )
+
+    shap_df = pd.DataFrame(rows)
+    if shap_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    driver_summary = (
+        shap_df.groupby("Driver", as_index=False)
+        .agg(
+            Mean_Abs_SHAP=("Abs_SHAP_Value", "mean"),
+            Mean_SHAP=("SHAP_Value", "mean"),
+            Observations=("Driver", "size"),
+            Theme=("Theme", "first"),
+        )
+        .sort_values(by="Mean_Abs_SHAP", ascending=False)
+    )
+    theme_summary = (
+        shap_df.groupby("Theme", as_index=False)
+        .agg(
+            Mean_Abs_SHAP=("Abs_SHAP_Value", "mean"),
+            Observations=("Theme", "size"),
+        )
+        .sort_values(by="Mean_Abs_SHAP", ascending=False)
+    )
+    return driver_summary, theme_summary
+
+
+def _plot_g10_shap_summary(
+    driver_summary: pd.DataFrame,
+    output_path: str | Path,
+    top_n: int = 20,
+) -> None:
+    """Save a G10 SHAP summary bar chart."""
+    if driver_summary.empty:
+        return
+
+    plot_df = driver_summary.head(top_n).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.barh(plot_df["Driver"], plot_df["Mean_Abs_SHAP"], color="tab:teal", alpha=0.85)
+    ax.set_title("G10 SHAP Summary: Mean Absolute Driver Contribution")
+    ax.set_xlabel("Mean |SHAP|")
+    ax.set_ylabel("Driver")
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def build_final_advanced_ml_report(master_table: pd.DataFrame) -> pd.DataFrame:
+    """Build the final thesis-facing comparison table."""
+    regularized_candidates = ["RidgeCV", "LassoCV", "ElasticNetCV", "SGDRegressor"]
+    gbm_candidates = ["XGBRegressor", "LGBMRegressor"]
+
+    regularized = master_table.loc[master_table["Model"].isin(regularized_candidates)].head(1).copy()
+    gbm = master_table.loc[master_table["Model"].isin(gbm_candidates)].head(1).copy()
+    baseline = master_table.loc[master_table["Model"] == "OLS"].head(1).copy()
+    stacked = master_table.loc[master_table["Model"] == "StackedEnsemble"].head(1).copy()
+
+    pieces = []
+    if not baseline.empty:
+        baseline.insert(0, "Comparison_Group", "Baseline OLS")
+        pieces.append(baseline)
+    if not regularized.empty:
+        regularized.insert(0, "Comparison_Group", "Best Regularized")
+        pieces.append(regularized)
+    if not gbm.empty:
+        gbm.insert(0, "Comparison_Group", "Best GBM")
+        pieces.append(gbm)
+    if not stacked.empty:
+        stacked.insert(0, "Comparison_Group", "Stacked Ensemble")
+        pieces.append(stacked)
+
+    if not pieces:
+        return pd.DataFrame()
+    return pd.concat(pieces, axis=0, ignore_index=True)
 
 
 def build_g10_master_comparison_table(
@@ -989,7 +1162,31 @@ def save_stage2_g10_master_comparison(
     master_table = build_g10_master_comparison_table(comparison_summaries)
     master_path = Path(output_dir) / "stage2_g10_master_model_ranking.csv"
     master_table.to_csv(master_path, index=False)
-    return {"master_ranking_csv": master_path}
+    final_report = build_final_advanced_ml_report(master_table)
+    final_report_path = Path(output_dir) / "stage2_final_advanced_ml_report.csv"
+    if not final_report.empty:
+        final_report.to_csv(final_report_path, index=False)
+
+    shap_driver_summary, shap_theme_summary = build_g10_shap_summary(
+        currencies=currencies,
+        output_dir=output_dir,
+    )
+    shap_driver_path = Path(output_dir) / "stage2_g10_shap_driver_summary.csv"
+    shap_theme_path = Path(output_dir) / "stage2_g10_shap_theme_summary.csv"
+    shap_plot_path = Path(output_dir) / "stage2_g10_shap_summary.png"
+    if not shap_driver_summary.empty:
+        shap_driver_summary.to_csv(shap_driver_path, index=False)
+        shap_theme_summary.to_csv(shap_theme_path, index=False)
+        _plot_g10_shap_summary(shap_driver_summary, shap_plot_path)
+
+    saved = {"master_ranking_csv": master_path}
+    if not final_report.empty:
+        saved["final_advanced_report_csv"] = final_report_path
+    if not shap_driver_summary.empty:
+        saved["g10_shap_driver_summary_csv"] = shap_driver_path
+        saved["g10_shap_theme_summary_csv"] = shap_theme_path
+        saved["g10_shap_summary_png"] = shap_plot_path
+    return saved
 
 
 def save_stage2_ml_performance_audit(
