@@ -773,11 +773,15 @@ def _plot_multi_model_equity_curves(
 ) -> None:
     """Save a multi-model equity-curve comparison plot."""
     fig, ax = plt.subplots(figsize=(14, 6))
+    oos_start: pd.Timestamp | None = None
 
     for model_name, audit_df in audit_map.items():
         plot_df = audit_df.loc[audit_df["Strategy_Equity_Curve"].notna()]
         if plot_df.empty:
             continue
+        model_start = plot_df.index.min()
+        if oos_start is None or model_start < oos_start:
+            oos_start = model_start
         ax.plot(
             plot_df.index,
             plot_df["Strategy_Equity_Curve"],
@@ -786,6 +790,15 @@ def _plot_multi_model_equity_curves(
         )
 
     ax.axhline(1.0, color="grey", linestyle=":", linewidth=1.0)
+    if oos_start is not None:
+        ax.axvline(
+            x=oos_start,
+            color="grey",
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.9,
+            label="OOS Start",
+        )
     ax.set_title(f"{currency.upper()} Stage 2 Multi-Model Equity Curves")
     ax.set_ylabel("Equity Curve")
     ax.set_xlabel("Date")
