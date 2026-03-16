@@ -33,6 +33,7 @@ DEFAULT_CURRENCIES = ("eur", "gbp", "aud", "nzd", "cad", "jpy", "chf", "nok", "s
 
 
 from src.stage2_ml_models import DEFAULT_MODELS, MODEL_LABELS, run_stage2_model_suite
+from src.stage2_policy_agent import PolicyAgent
 
 
 def _sanitize_column_name(name: str) -> str:
@@ -1069,7 +1070,7 @@ def _plot_g10_shap_summary(
 
     plot_df = driver_summary.head(top_n).iloc[::-1]
     fig, ax = plt.subplots(figsize=(12, 8))
-    ax.barh(plot_df["Driver"], plot_df["Mean_Abs_SHAP"], color="tab:teal", alpha=0.85)
+    ax.barh(plot_df["Driver"], plot_df["Mean_Abs_SHAP"], color="teal", alpha=0.85)
     ax.set_title("G10 SHAP Summary: Mean Absolute Driver Contribution")
     ax.set_xlabel("Mean |SHAP|")
     ax.set_ylabel("Driver")
@@ -1079,32 +1080,87 @@ def _plot_g10_shap_summary(
 
 
 def build_final_advanced_ml_report(master_table: pd.DataFrame) -> pd.DataFrame:
-    """Build the final thesis-facing comparison table."""
-    regularized_candidates = ["RidgeCV", "LassoCV", "ElasticNetCV", "SGDRegressor"]
-    gbm_candidates = ["XGBRegressor", "LGBMRegressor"]
+    """Build the final thesis-facing 8-model ranking report."""
+    report = master_table.copy()
+    family_map = {
+        "OLS": "Baseline",
+        "RidgeCV": "Regularized",
+        "LassoCV": "Regularized",
+        "ElasticNetCV": "Regularized",
+        "SGDRegressor": "Regularized",
+        "XGBRegressor": "GBM",
+        "LGBMRegressor": "GBM",
+        "StackedEnsemble": "Stacked",
+    }
+    report.insert(0, "Model_Family", report["Model"].map(family_map).fillna("Other"))
+    report.insert(0, "Final_Rank", np.arange(1, len(report) + 1))
+    return report
 
-    regularized = master_table.loc[master_table["Model"].isin(regularized_candidates)].head(1).copy()
-    gbm = master_table.loc[master_table["Model"].isin(gbm_candidates)].head(1).copy()
-    baseline = master_table.loc[master_table["Model"] == "OLS"].head(1).copy()
-    stacked = master_table.loc[master_table["Model"] == "StackedEnsemble"].head(1).copy()
 
-    pieces = []
-    if not baseline.empty:
-        baseline.insert(0, "Comparison_Group", "Baseline OLS")
-        pieces.append(baseline)
-    if not regularized.empty:
-        regularized.insert(0, "Comparison_Group", "Best Regularized")
-        pieces.append(regularized)
-    if not gbm.empty:
-        gbm.insert(0, "Comparison_Group", "Best GBM")
-        pieces.append(gbm)
-    if not stacked.empty:
-        stacked.insert(0, "Comparison_Group", "Stacked Ensemble")
-        pieces.append(stacked)
+def save_policy_agent_comparison(
+    currencies: Sequence[str] = DEFAULT_CURRENCIES,
+    output_dir: str | Path = DEFAULT_AUDIT_DIR,
+    agent_epochs: int = 8,
+) -> Dict[str, Path]:
+    """Run the prototype PolicyAgent on the stacked audit datasets and save a comparison plot."""
+    root = Path(output_dir)
+    stacked_curves = []
+    policy_curves = []
 
-    if not pieces:
-        return pd.DataFrame()
-    return pd.concat(pieces, axis=0, ignore_index=True)
+    for currency in currencies:
+        currency_dir = root / currency.lower()
+        stacked_path = currency_dir / "stage2_stacked_audit_dataset.csv"
+        if not stacked_path.exists():
+            continue
+
+        stacked_df = pd.read_csv(stacked_path, index_col="Date", parse_dates=["Date"])
+        agent = PolicyAgent(epsilon=0.05)
+        policy_df = agent.train(stacked_df, epochs=agent_epochs)
+
+        policy_path = currency_dir / "stage2_policy_agent_dataset.csv"
+        policy_df.to_csv(policy_path, index=True)
+
+        stacked_curve = stacked_df[["Strategy_Equity_Curve"]].rename(
+            columns={"Strategy_Equity_Curve": currency.upper()}
+        )
+        policy_curve = policy_df[["Policy_Equity_Curve"]].rename(
+            columns={"Policy_Equity_Curve": currency.upper()}
+        )
+        stacked_curves.append(stacked_curve)
+        policy_curves.append(policy_curve)
+
+    if not stacked_curves or not policy_curves:
+        return {}
+
+    stacked_panel = pd.concat(stacked_curves, axis=1).sort_index().ffill()
+    policy_panel = pd.concat(policy_curves, axis=1).sort_index().ffill()
+    comparison = pd.DataFrame(
+        {
+            "StackedEnsemble_G10": stacked_panel.mean(axis=1, skipna=True),
+            "PolicyAgent_G10": policy_panel.mean(axis=1, skipna=True),
+        }
+    ).dropna(how="all")
+
+    comparison_path = root / "stage2_policy_vs_stacked_equity_curve.csv"
+    comparison.to_csv(comparison_path, index=True)
+
+    plot_path = root / "stage2_policy_vs_stacked_equity_curve.png"
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(comparison.index, comparison["StackedEnsemble_G10"], label="StackedEnsemble", linewidth=1.6)
+    ax.plot(comparison.index, comparison["PolicyAgent_G10"], label="PolicyAgent", linewidth=1.6)
+    ax.axhline(1.0, color="grey", linestyle=":", linewidth=1.0)
+    ax.set_title("G10 PolicyAgent vs StackedEnsemble Equity Curve")
+    ax.set_ylabel("Equity Curve")
+    ax.set_xlabel("Date")
+    ax.legend(loc="best")
+    plt.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "policy_vs_stacked_curve_csv": comparison_path,
+        "policy_vs_stacked_curve_png": plot_path,
+    }
 
 
 def build_g10_master_comparison_table(
@@ -1186,6 +1242,7 @@ def save_stage2_g10_master_comparison(
         saved["g10_shap_driver_summary_csv"] = shap_driver_path
         saved["g10_shap_theme_summary_csv"] = shap_theme_path
         saved["g10_shap_summary_png"] = shap_plot_path
+    saved.update(save_policy_agent_comparison(currencies=currencies, output_dir=output_dir))
     return saved
 
 
