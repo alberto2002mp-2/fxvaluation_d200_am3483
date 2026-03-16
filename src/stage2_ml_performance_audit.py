@@ -1079,9 +1079,17 @@ def _plot_g10_shap_summary(
     plt.close(fig)
 
 
-def build_final_advanced_ml_report(master_table: pd.DataFrame) -> pd.DataFrame:
+def build_final_advanced_ml_report(
+    master_table: pd.DataFrame,
+    currencies: Sequence[str] = DEFAULT_CURRENCIES,
+    output_dir: str | Path = DEFAULT_AUDIT_DIR,
+) -> pd.DataFrame:
     """Build the final thesis-facing 8-model ranking report."""
     report = master_table.copy()
+    policy_summary = build_policy_agent_summary(currencies=currencies, output_dir=output_dir)
+    if not policy_summary.empty:
+        report = pd.concat([report, policy_summary], axis=0, ignore_index=True, sort=False)
+
     family_map = {
         "OLS": "Baseline",
         "RidgeCV": "Regularized",
@@ -1091,7 +1099,24 @@ def build_final_advanced_ml_report(master_table: pd.DataFrame) -> pd.DataFrame:
         "XGBRegressor": "GBM",
         "LGBMRegressor": "GBM",
         "StackedEnsemble": "Stacked",
+        "PolicyAgent": "RL",
     }
+
+    report["IC_Rank"] = report["Average_Information_Coefficient"].rank(
+        ascending=True,
+        method="dense",
+        na_option="bottom",
+    )
+    report["Hit_Rank"] = report["Average_Hit_Rate_Pct"].rank(
+        ascending=False,
+        method="dense",
+        na_option="bottom",
+    )
+    report["Combined_Rank"] = (report["IC_Rank"] + report["Hit_Rank"]) / 2.0
+    report = report.sort_values(
+        by=["Combined_Rank", "Average_Information_Coefficient", "Average_Hit_Rate_Pct"],
+        ascending=[True, True, False],
+    ).reset_index(drop=True)
     report.insert(0, "Model_Family", report["Model"].map(family_map).fillna("Other"))
     report.insert(0, "Final_Rank", np.arange(1, len(report) + 1))
     return report
@@ -1161,6 +1186,76 @@ def save_policy_agent_comparison(
         "policy_vs_stacked_curve_csv": comparison_path,
         "policy_vs_stacked_curve_png": plot_path,
     }
+
+
+def build_policy_agent_summary(
+    currencies: Sequence[str] = DEFAULT_CURRENCIES,
+    output_dir: str | Path = DEFAULT_AUDIT_DIR,
+) -> pd.DataFrame:
+    """Aggregate PolicyAgent performance across currencies for the final report."""
+    rows: list[Dict[str, Any]] = []
+    root = Path(output_dir)
+
+    for currency in currencies:
+        currency_dir = root / currency.lower()
+        policy_path = currency_dir / "stage2_policy_agent_dataset.csv"
+        stacked_path = currency_dir / "stage2_stacked_audit_dataset.csv"
+        if not policy_path.exists() or not stacked_path.exists():
+            continue
+
+        policy_df = pd.read_csv(policy_path, index_col="Date", parse_dates=["Date"])
+        stacked_df = pd.read_csv(stacked_path, index_col="Date", parse_dates=["Date"])
+        merged = policy_df.join(stacked_df[["Forward_10d_Return"]], how="left")
+
+        signal_df = merged.loc[
+            merged["Policy_Position"].isin([-1, 1]) & merged["Forward_10d_Return"].notna()
+        ].copy()
+        if signal_df.empty:
+            hit_rate = np.nan
+        else:
+            hits = (
+                ((signal_df["Policy_Position"] == 1) & (signal_df["Forward_10d_Return"] > 0.0))
+                | ((signal_df["Policy_Position"] == -1) & (signal_df["Forward_10d_Return"] < 0.0))
+            )
+            hit_rate = float(hits.mean() * 100.0)
+
+        rows.append(
+            {
+                "Currency": currency.upper(),
+                "Model": "PolicyAgent",
+                "Sharpe_Ratio": float(_annualized_sharpe_ratio(policy_df["Reward"])),
+                "Maximum_Drawdown_Pct": float(
+                    _max_drawdown(policy_df["Policy_Equity_Curve"]) * 100.0
+                ),
+                "Strategy_Total_Return_Pct": float(
+                    (policy_df["Policy_Equity_Curve"].iloc[-1] - 1.0) * 100.0
+                ),
+                "Hit_Rate_Pct": hit_rate,
+                "Information_Coefficient": np.nan,
+                "Generalization_Gap": np.nan,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    combined = pd.DataFrame(rows)
+    return pd.DataFrame(
+        [
+            {
+                "Model": "PolicyAgent",
+                "Currencies": int(combined["Currency"].nunique()),
+                "Average_Information_Coefficient": np.nan,
+                "Average_Hit_Rate_Pct": float(combined["Hit_Rate_Pct"].mean()),
+                "Average_Sharpe_Ratio": float(combined["Sharpe_Ratio"].mean()),
+                "Average_Maximum_Drawdown_Pct": float(combined["Maximum_Drawdown_Pct"].mean()),
+                "Average_Generalization_Gap": np.nan,
+                "Average_Strategy_Total_Return_Pct": float(
+                    combined["Strategy_Total_Return_Pct"].mean()
+                ),
+            }
+        ]
+    )
 
 
 def save_g10_average_model_equity_curves(
@@ -1248,6 +1343,7 @@ def build_g10_master_comparison_table(
             Average_Sharpe_Ratio=("Sharpe_Ratio", "mean"),
             Average_Maximum_Drawdown_Pct=("Maximum_Drawdown_Pct", "mean"),
             Average_Generalization_Gap=("Generalization_Gap", "mean"),
+            Average_Strategy_Total_Return_Pct=("Strategy_Total_Return_Pct", "mean"),
         )
     )
     grouped["IC_Rank"] = grouped["Average_Information_Coefficient"].rank(
@@ -1288,7 +1384,11 @@ def save_stage2_g10_master_comparison(
     master_table = build_g10_master_comparison_table(comparison_summaries)
     master_path = Path(output_dir) / "stage2_g10_master_model_ranking.csv"
     master_table.to_csv(master_path, index=False)
-    final_report = build_final_advanced_ml_report(master_table)
+    final_report = build_final_advanced_ml_report(
+        master_table,
+        currencies=currencies,
+        output_dir=output_dir,
+    )
     final_report_path = Path(output_dir) / "stage2_final_advanced_ml_report.csv"
     if not final_report.empty:
         final_report.to_csv(final_report_path, index=False)
