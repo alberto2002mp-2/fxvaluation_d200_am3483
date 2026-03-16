@@ -1163,6 +1163,76 @@ def save_policy_agent_comparison(
     }
 
 
+def save_g10_average_model_equity_curves(
+    currencies: Sequence[str] = DEFAULT_CURRENCIES,
+    models: Sequence[str] = DEFAULT_MODELS,
+    output_dir: str | Path = DEFAULT_AUDIT_DIR,
+) -> Dict[str, Path]:
+    """Save a G10-average multi-model equity-curve chart, including PolicyAgent."""
+    root = Path(output_dir)
+    average_curves: Dict[str, pd.Series] = {}
+
+    for model_name in models:
+        model_key = model_name.lower()
+        model_curves = []
+        for currency in currencies:
+            audit_path = root / currency.lower() / f"stage2_{model_key}_audit_dataset.csv"
+            if not audit_path.exists():
+                continue
+
+            audit_df = pd.read_csv(audit_path, index_col="Date", parse_dates=["Date"])
+            if "Strategy_Equity_Curve" not in audit_df.columns:
+                continue
+
+            curve = audit_df[["Strategy_Equity_Curve"]].rename(
+                columns={"Strategy_Equity_Curve": currency.upper()}
+            )
+            model_curves.append(curve)
+
+        if not model_curves:
+            continue
+
+        model_panel = pd.concat(model_curves, axis=1).sort_index().ffill()
+        average_curves[MODEL_LABELS.get(model_key, model_key.upper())] = model_panel.mean(
+            axis=1,
+            skipna=True,
+        )
+
+    average_df = pd.DataFrame(average_curves).sort_index()
+    policy_path = root / "stage2_policy_vs_stacked_equity_curve.csv"
+    if policy_path.exists():
+        policy_df = pd.read_csv(policy_path, index_col="Date", parse_dates=["Date"])
+        if "PolicyAgent_G10" in policy_df.columns:
+            average_df["PolicyAgent"] = policy_df["PolicyAgent_G10"]
+
+    average_df = average_df.dropna(how="all")
+    if average_df.empty:
+        return {}
+
+    csv_path = root / "stage2_g10_model_equity_curves.csv"
+    png_path = root / "stage2_g10_model_equity_curves.png"
+    average_df.to_csv(csv_path, index=True)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    for column in average_df.columns:
+        linewidth = 1.8 if column == "PolicyAgent" else 1.4
+        ax.plot(average_df.index, average_df[column], label=column, linewidth=linewidth)
+
+    ax.axhline(1.0, color="grey", linestyle=":", linewidth=1.0)
+    ax.set_title("G10 Average Stage 2 Multi-Model Equity Curves")
+    ax.set_ylabel("Average Equity Curve")
+    ax.set_xlabel("Date")
+    ax.legend(loc="best")
+    plt.tight_layout()
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "g10_model_equity_curves_csv": csv_path,
+        "g10_model_equity_curves_png": png_path,
+    }
+
+
 def build_g10_master_comparison_table(
     comparison_summaries: Sequence[pd.DataFrame],
 ) -> pd.DataFrame:
@@ -1243,6 +1313,13 @@ def save_stage2_g10_master_comparison(
         saved["g10_shap_theme_summary_csv"] = shap_theme_path
         saved["g10_shap_summary_png"] = shap_plot_path
     saved.update(save_policy_agent_comparison(currencies=currencies, output_dir=output_dir))
+    saved.update(
+        save_g10_average_model_equity_curves(
+            currencies=currencies,
+            models=models,
+            output_dir=output_dir,
+        )
+    )
     return saved
 
 
