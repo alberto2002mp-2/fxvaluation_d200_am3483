@@ -763,6 +763,9 @@ def _summarize_model_audit(
         "Maximum_Drawdown_Pct": float(_max_drawdown(audit_df["Strategy_Equity_Curve"]) * 100.0),
         "Strategy_Total_Return_Pct": float((audit_df["Strategy_Equity_Curve"].iloc[-1] - 1.0) * 100.0),
         "Average_Adj_R2": float(audit_df["Adj_R2"].dropna().mean()) if audit_df["Adj_R2"].notna().any() else np.nan,
+        "Average_Rolling_RMSE": float(audit_df["RMSE"].dropna().mean())
+        if "RMSE" in audit_df and audit_df["RMSE"].notna().any()
+        else np.nan,
         "Average_Train_RMSE": avg_train_rmse,
         "Average_Validation_RMSE": avg_validation_rmse,
         "Test_RMSE": test_rmse,
@@ -1249,6 +1252,8 @@ def build_policy_agent_summary(
                 "Average_Hit_Rate_Pct": float(combined["Hit_Rate_Pct"].mean()),
                 "Average_Sharpe_Ratio": float(combined["Sharpe_Ratio"].mean()),
                 "Average_Maximum_Drawdown_Pct": float(combined["Maximum_Drawdown_Pct"].mean()),
+                "Average_Adj_R2": np.nan,
+                "Average_Rolling_RMSE": np.nan,
                 "Average_Generalization_Gap": np.nan,
                 "Average_Strategy_Total_Return_Pct": float(
                     combined["Strategy_Total_Return_Pct"].mean()
@@ -1333,6 +1338,9 @@ def build_g10_master_comparison_table(
 ) -> pd.DataFrame:
     """Aggregate per-currency comparison summaries into one master ranking table."""
     combined = pd.concat(comparison_summaries, axis=0, ignore_index=True)
+    for column in ("Average_Adj_R2", "Average_Rolling_RMSE", "Average_Strategy_Total_Return_Pct"):
+        if column not in combined.columns:
+            combined[column] = np.nan
 
     grouped = (
         combined.groupby("Model", as_index=False)
@@ -1342,6 +1350,8 @@ def build_g10_master_comparison_table(
             Average_Hit_Rate_Pct=("Hit_Rate_Pct", "mean"),
             Average_Sharpe_Ratio=("Sharpe_Ratio", "mean"),
             Average_Maximum_Drawdown_Pct=("Maximum_Drawdown_Pct", "mean"),
+            Average_Adj_R2=("Average_Adj_R2", "mean"),
+            Average_Rolling_RMSE=("Average_Rolling_RMSE", "mean"),
             Average_Generalization_Gap=("Generalization_Gap", "mean"),
             Average_Strategy_Total_Return_Pct=("Strategy_Total_Return_Pct", "mean"),
         )
