@@ -1,183 +1,292 @@
-# FX Valuation - Machine Learning for Fair Value Prediction
-Using Machine Learning to determine short-term fair values for FX rates
+# FX Valuation — Reproducible Stage 1 + Stage 2 Pipeline
 
-## Project Overview
+This repository implements an end-to-end quantitative FX fair-value workflow across G10 currencies:
 
-This project applies advanced machine learning techniques to predict short-term fair values for foreign exchange (FX) rates. The repository is structured for maximum reproducibility and follows industry best practices for data science projects.
+- **Stage 1**: rolling driver discovery (univariate OLS, significance filtering, diversified top-driver selection)
+- **Stage 2**: walk-forward machine-learning fair-value models (OLS, Ridge, Lasso, ElasticNet, SGD, XGBoost, LightGBM, stacked ensemble)
+- **Audit layer**: signal quality, forward-return validation, strategy equity curves, model comparison, and cross-currency summary outputs
 
-### Key Features
-- Modular code structure for easy maintenance and scaling
-- Comprehensive data pipeline from raw data to model predictions
-- Jupyter notebooks for exploratory data analysis and visualization
-- Production-ready virtual environment setup
-- Reproducible results with version-controlled dependencies
+The instructions below are designed so a new user can run the project on their own machine and reproduce the outputs in `data/processed/` and `data/audits/`.
 
 ---
 
-## Getting Started
+## 1) Repository layout
 
-### Prerequisites
-- **Python 3.8 or higher** (Download from [python.org](https://www.python.org/))
-- **Git** (for cloning the repository)
-- **Windows PowerShell** (for running the setup script)
-
-### Installation & Setup
-
-Follow these steps to set up the project on your machine:
-
-#### 1. Clone the Repository
-You can clone the repository using your preferred protocol. Examples:
-
-**HTTPS:**
-```bash
-git clone https://github.com/alberto2002mp-2/fxvaluation_d200_am3483.git
-cd fxvaluation_d200_am3483
+```text
+fxvaluation_d200_am3483/
+├── config.py
+├── requirements.txt
+├── setup_env.ps1
+├── data/
+│   ├── rawdata.xlsx                     # Primary source dataset
+│   ├── processed/                       # Master training CSVs per currency
+│   ├── audits/                          # Main Stage 2 audit outputs
+│   └── audits_test/                     # Test/sandbox audit outputs
+├── notebooks/
+│   ├── explore_dataframes.ipynb
+│   ├── ultimate_dataframes.ipynb
+│   ├── ols_regressions.ipynb
+│   └── fairvalue_ols.ipynb
+└── src/
+    ├── data/                            # Data loading + transformation pipeline
+    ├── rolling_univariate_ols.py        # Stage 1 rolling single-factor regressions
+    ├── diversified_top_drivers_history.py
+    ├── stage2_ml_models.py              # Stage 2 model runner (CLI)
+    ├── stage2_ml_performance_audit.py   # Stage 2 audit runner (CLI)
+    ├── stage2_fair_value_runner.py      # Convenience fair-value runner
+    └── stage2_policy_agent.py           # Prototype RL threshold policy agent
 ```
 
-**GitHub CLI:**
-```bash
-gh repo clone alberto2002mp-2/fxvaluation_d200_am3483
-cd fxvaluation_d200_am3483
-```
+---
 
-Replace the URL with the one appropriate for your account if you forked the repo.
+## 2) System requirements
 
-#### 2. Run the Setup Script (Windows)
-Execute the PowerShell setup script to automatically create a virtual environment and install dependencies:
+- **Python**: 3.10+ recommended (3.8+ should work per dependency bounds)
+- **OS**: Linux/macOS/Windows
+- **RAM**: 8 GB minimum, 16 GB recommended for full multi-model + multi-currency runs
+- **Disk**: 2+ GB free space for outputs/plots
+
+Python dependencies are pinned by lower bounds in `requirements.txt` and include:
+`pandas`, `numpy`, `statsmodels`, `scikit-learn`, `xgboost`, `lightgbm`, `matplotlib`, `seaborn`, `plotly`, `openpyxl`, `jupyter`.
+
+---
+
+## 3) Environment setup
+
+### Option A (Windows PowerShell, automated)
 
 ```powershell
-# If you encounter an execution policy error, run:
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-
-# Then run the setup script:
+# From repo root
 .\setup_env.ps1
 ```
 
-The script will:
-- ✓ Verify Python installation
-- ✓ Create a virtual environment (`venv` folder)
-- ✓ Activate the virtual environment
-- ✓ Upgrade pip, setuptools, and wheel
-- ✓ Install all required dependencies from `requirements.txt`
-
-#### 3. Manual Setup (Alternative Method)
-If you prefer to set up manually or use a non-Windows system:
+### Option B (cross-platform, manual)
 
 ```bash
-# Create virtual environment
-python -m venv venv
+# From repo root
+python -m venv .venv
 
-# Activate virtual environment
-# On Windows:
-venv\Scripts\activate
-# On macOS/Linux:
-source venv/bin/activate
+# Activate
+# Linux/macOS
+source .venv/bin/activate
+# Windows (PowerShell)
+.\.venv\Scripts\Activate.ps1
 
-# Upgrade pip
-python -m pip install --upgrade pip
-
-# Install dependencies
+python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
----
+### Verify installation
 
-## Project Structure
-
-```
-fxvaluation_d200_am3483/
-├── data/              # Dataset storage (raw and processed data)
-│   ├── raw/          # Original, immutable data
-│   └── processed/    # Cleaned and transformed data
-├── notebooks/         # Jupyter notebooks for analysis
-│   ├── 01_EDA.ipynb  # Exploratory Data Analysis
-│   └── 02_Modeling.ipynb  # Model development and evaluation
-├── src/              # Python modules and utilities
-│   ├── __init__.py
-│   ├── data.py       # Data loading and preprocessing
-│   ├── features.py   # Feature engineering
-│   └── models.py     # Model definitions and training
-├── setup_env.ps1     # Automated setup script (Windows)
-├── requirements.txt  # Python dependencies
-├── .gitignore        # Git ignore rules
-├── LICENSE           # Project license
-└── README.md         # This file
-```
-
----
-
-## Dependencies
-
-The project uses the following key Python libraries:
-
-- **pandas** (2.0.0+): Data manipulation and analysis
-- **numpy** (1.24.0+): Numerical computing
-- **scikit-learn** (1.3.0+): Machine learning algorithms
-- **matplotlib** (3.7.0+): Data visualization
-- **xgboost** (2.0.0+): Gradient boosting framework
-- **lightgbm** (4.0.0+): Fast gradient boosting
-- **jupyter** (1.0.0+): Interactive computing environment
-- **ipykernel** (6.25.0+): IPython kernel for Jupyter
-
-For a complete list, see [requirements.txt](requirements.txt).
-
----
-
-## Quick Start
-
-Once the environment is set up, you can start working immediately:
-
-### Activate the Virtual Environment
 ```bash
-# Windows
-venv\Scripts\activate
-
-# macOS/Linux
-source venv/bin/activate
+python -c "import pandas, numpy, sklearn, statsmodels, xgboost, lightgbm, plotly; print('env-ok')"
 ```
 
-### Launch Jupyter Notebook
+---
+
+## 4) Data expectations and reproducibility assumptions
+
+1. `data/rawdata.xlsx` must exist and be readable (it is the raw source used by the loaders).
+2. The project builds many objects at import time; always run commands from **repo root**.
+3. Some model classes are deterministic by construction, while tree/ensemble methods may show minor run-to-run drift from backend threading/library differences.
+4. To maximize reproducibility across machines, keep:
+    - same Python/dependency versions,
+    - same input Excel file,
+    - same command parameters,
+    - same timezone/locale defaults where possible.
+
+---
+
+## 5) Full runbook to replicate results
+
+## Step 0 — Sanity-check the source file
+
+```bash
+python -c "from pathlib import Path; p=Path('data/rawdata.xlsx'); print(p.resolve(), p.exists())"
+```
+
+Expected: path printed with `True`.
+
+## Step 1 — Build master training CSVs (Stage 0/1 preparation)
+
+This creates one file per currency in `data/processed/` (e.g., `eur_master.csv`, `jpy_master.csv`).
+
+```bash
+python -m src.data.build_model_ready_data
+```
+
+Optional custom parameters:
+
+```bash
+python - <<'PY'
+from src.data.build_model_ready_data import save_master_training_csvs
+save_master_training_csvs(window=250, min_significance=95.0, top_n=3)
+print('master-csvs-built')
+PY
+```
+
+## Step 2 — Run Stage 2 model suite for one currency
+
+Generates per-model output CSVs in `data/model_outputs/<currency>/`.
+
+```bash
+python -m src.stage2_ml_models eur \
+    --models ols ridge lasso elasticnet sgd xgb lgbm stacked \
+    --window 250 \
+    --error-sum-window 10 \
+    --recenter-window 60 \
+    --cv-splits 4 \
+    --retune-frequency 60
+```
+
+Repeat for all currencies as needed:
+`eur gbp aud nzd cad jpy chf nok sek`.
+
+## Step 3 — Generate Stage 2 audit for one currency
+
+### 3A) Baseline single-model audit (OLS-focused)
+
+```bash
+python -m src.stage2_ml_performance_audit eur \
+    --window 50 \
+    --error-sum-window 10 \
+    --recenter-window 60 \
+    --forward-days 10 \
+    --threshold 2.0
+```
+
+### 3B) Multi-model comparison audit
+
+```bash
+python -m src.stage2_ml_performance_audit eur \
+    --compare-models \
+    --models ols ridge lasso elasticnet sgd xgb lgbm stacked \
+    --window 50 \
+    --error-sum-window 10 \
+    --recenter-window 60
+```
+
+Outputs are saved under `data/audits/eur/` (same structure for each currency).
+
+## Step 4 — Replicate full G10 comparison package
+
+This runs the multi-model comparison across all currencies and writes aggregate ranking and SHAP summaries.
+
+```bash
+python - <<'PY'
+from src.stage2_ml_performance_audit import save_stage2_g10_master_comparison
+
+saved = save_stage2_g10_master_comparison(
+    currencies=("eur","gbp","aud","nzd","cad","jpy","chf","nok","sek"),
+    models=("ols","ridge","lasso","elasticnet","sgd","xgb","lgbm","stacked"),
+    output_dir="data/audits",
+    window=50,
+    error_sum_window=10,
+    recenter_window=60,
+    forward_days=10,
+    threshold=2.0,
+)
+
+for k, v in saved.items():
+    print(f"{k}: {v}")
+PY
+```
+
+Key expected aggregate files include:
+
+- `data/audits/stage2_g10_master_model_ranking.csv`
+- `data/audits/stage2_final_advanced_ml_report.csv` (if generated)
+- `data/audits/stage2_g10_shap_driver_summary.csv` (if generated)
+- `data/audits/stage2_g10_shap_theme_summary.csv` (if generated)
+- `data/audits/stage2_policy_vs_stacked_equity_curve.csv`
+
+---
+
+## 6) How to run each major script/module
+
+## Data / feature engineering modules
+
+- `python -m src.data.load_excel_sheets` — parse workbook sheets and print shape/date ranges.
+- `python -m src.data.standardize_rolling_drivers` — build standardized rolling driver map.
+- `python -m src.data.build_model_ready_data` — generate and save currency master CSVs.
+
+## Stage 1 driver discovery
+
+- `python -m src.rolling_univariate_ols` — rolling beta/significance maps.
+- `python -m src.top_drivers_history` — top drivers by significance.
+- `python -m src.diversified_top_drivers_history` — category-diversified top drivers.
+
+## Stage 2 fair value + model outputs
+
+- `python -m src.stage2_ml_models <currency> [options]` — primary model runner CLI.
+- `python -m src.stage2_fair_value_runner` — convenience OLS fair-value run + plot.
+
+## Stage 2 auditing/reporting
+
+- `python -m src.stage2_ml_performance_audit <currency> [options]` — baseline or multi-model audit.
+
+## Notebook workflow (optional)
+
+After environment activation:
+
 ```bash
 jupyter notebook notebooks/
 ```
 
-### Deactivate the Virtual Environment
+Suggested order:
+1. `explore_dataframes.ipynb`
+2. `ultimate_dataframes.ipynb`
+3. `ols_regressions.ipynb`
+4. `fairvalue_ols.ipynb`
+
+---
+
+## 7) Validation checks after a full run
+
+Use these checks to confirm a successful replication:
+
 ```bash
-deactivate
+# 1) Processed masters exist
+python -c "from pathlib import Path; req=['eur','gbp','aud','nzd','cad','jpy','chf','nok','sek']; print(all((Path('data/processed')/f'{c}_master.csv').exists() for c in req))"
+
+# 2) One currency audit summary exists
+python -c "from pathlib import Path; print((Path('data/audits/eur/stage2_model_comparison_summary.csv')).exists())"
+
+# 3) G10 aggregate ranking exists
+python -c "from pathlib import Path; print((Path('data/audits/stage2_g10_master_model_ranking.csv')).exists())"
 ```
 
 ---
 
-## Troubleshooting
+## 8) Operational best practices (industry standard)
 
-### Issue: "Python is not recognized"
-**Solution**: Add Python to your system PATH or reinstall Python with "Add Python to PATH" option selected.
-
-### Issue: "The execution policy prevents running scripts"
-**Solution**: Run this command in PowerShell:
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
-
-### Issue: Virtual environment won't activate
-**Solution**: Delete the `venv` folder and run `setup_env.ps1` again.
-
-### Issue: Module import errors in Jupyter
-**Solution**: Ensure Jupyter is using the correct kernel:
-```bash
-python -m ipykernel install --user --name venv --display-name "Python (venv)"
-```
+- Run inside a dedicated virtual environment and lock package versions for production replication.
+- Keep raw data immutable (`data/rawdata.xlsx`) and version output artifacts separately.
+- Parameterize all runs (window, threshold, retune frequency) and log them with output paths.
+- Treat `data/audits/` as generated artifacts; avoid manual edits.
+- For team reproducibility, store command history (or a shell script) used to produce each results bundle.
 
 ---
 
+## 9) Troubleshooting
 
+- **`FileNotFoundError: Could not locate project root containing 'src'`**
+    - Run commands from repo root or use `python -m ...` module form.
+
+- **`rawdata.xlsx does not exist`**
+    - Ensure `data/rawdata.xlsx` is present and readable.
+
+- **LightGBM / XGBoost import issues**
+    - Reinstall dependencies in a clean environment:
+        `pip install --upgrade pip && pip install -r requirements.txt`
+
+- **No signals generated in audit output**
+    - Lower/adjust threshold (`--threshold`), increase sample window, or validate master CSV content.
+
+---
 
 ## License
 
-This project is licensed under the terms specified in the [LICENSE](LICENSE) file.
+This project is licensed under the terms in `LICENSE`.
 
 
----
-
-**Last Updated**: March 2026  
-**Environment**: Python 3.8+, Virtual Environment (venv)
