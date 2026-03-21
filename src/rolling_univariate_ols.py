@@ -12,16 +12,9 @@ import statsmodels.api as sm
 from statsmodels.regression.rolling import RollingOLS
 
 
-cwd = Path.cwd()
-if (cwd / "src").exists():
-    project_root = cwd
-elif (cwd.parent / "src").exists():
-    project_root = cwd.parent
-else:
-    raise FileNotFoundError("Could not locate project root containing 'src'.")
-
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 from src.data.build_ultimate_df import build_ultimate_df

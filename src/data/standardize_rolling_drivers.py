@@ -9,16 +9,9 @@ from typing import Dict
 import pandas as pd
 
 
-cwd = Path.cwd()
-if (cwd / "src").exists():
-    project_root = cwd
-elif (cwd.parent / "src").exists():
-    project_root = cwd.parent
-else:
-    raise FileNotFoundError("Could not locate project root containing 'src'.")
-
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 from src.data.build_ultimate_df import build_ultimate_df

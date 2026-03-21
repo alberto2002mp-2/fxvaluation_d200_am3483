@@ -6,8 +6,6 @@ import argparse
 import json
 from itertools import product
 from pathlib import Path
-import re
-import sys
 from typing import Any, Dict, Iterable, Sequence
 
 import lightgbm as lgb
@@ -23,25 +21,22 @@ from sklearn.linear_model import (
     RidgeCV,
     SGDRegressor,
 )
-from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from xgboost import DMatrix, XGBRegressor
 
+from src.stage2_common import (
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_PROCESSED_DIR,
+    active_feature_names as _active_feature_names,
+    adjusted_r2 as _adjusted_r2,
+    compute_days_in_signal as _compute_days_in_signal,
+    load_master_training_data,
+    rmse as _rmse,
+    sanitize_column_name as _sanitize_column_name,
+    top_driver_names,
+)
 
-cwd = Path.cwd()
-if (cwd / "src").exists():
-    project_root = cwd
-elif (cwd.parent / "src").exists():
-    project_root = cwd.parent
-else:
-    raise FileNotFoundError("Could not locate project root containing 'src'.")
 
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-
-DEFAULT_PROCESSED_DIR = project_root / "data" / "processed"
-DEFAULT_OUTPUT_DIR = project_root / "data" / "model_outputs"
 DEFAULT_MODELS = ("ols", "ridge", "lasso", "elasticnet", "sgd", "xgb", "lgbm", "stacked")
 LINEAR_MODELS = {"ols", "ridge", "lasso", "elasticnet", "sgd"}
 REGULARIZED_MODELS = {"ridge", "lasso", "elasticnet", "sgd"}
@@ -79,102 +74,6 @@ TREE_PARAM_GRID = {
     "learning_rate": (0.03, 0.1),
     "subsample": (0.8, 1.0),
 }
-
-
-def _sanitize_column_name(name: str) -> str:
-    """Convert a human-readable driver name into the saved snake_case form."""
-    clean = re.sub(r"[^0-9a-zA-Z]+", "_", name.strip())
-    clean = re.sub(r"_+", "_", clean).strip("_")
-    return clean.lower()
-
-
-def _compute_days_in_signal(error_z: pd.Series, threshold: float = 2.0) -> pd.Series:
-    """Count consecutive days where z-score stays above +threshold or below -threshold."""
-    regime = pd.Series(0, index=error_z.index, dtype=int)
-    regime = regime.where(~(error_z > threshold), 1)
-    regime = regime.where(~(error_z < -threshold), -1)
-
-    days = pd.Series(0, index=error_z.index, dtype=int)
-    run = 0
-    prev_regime = 0
-    for dt, current_regime in regime.items():
-        if current_regime == 0:
-            run = 0
-            prev_regime = 0
-        elif current_regime == prev_regime:
-            run += 1
-        else:
-            run = 1
-            prev_regime = current_regime
-        days.at[dt] = run
-
-    return days
-
-
-def _adjusted_r2(r2: float, n_obs: int, n_features: int) -> float:
-    """Return adjusted R^2, or NaN when undefined."""
-    if n_obs <= n_features + 1:
-        return np.nan
-    return 1 - (1 - r2) * ((n_obs - 1) / (n_obs - n_features - 1))
-
-
-def _rmse(y_true: pd.Series | np.ndarray, y_pred: pd.Series | np.ndarray) -> float:
-    """Return root mean squared error."""
-    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
-
-
-def load_master_training_data(
-    currency: str,
-    processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
-) -> pd.DataFrame:
-    """Load one saved master CSV and return the full modeling frame."""
-    csv_path = Path(processed_dir) / f"{currency.lower()}_master.csv"
-    if not csv_path.exists():
-        raise FileNotFoundError(
-            f"{csv_path} does not exist. Build the master CSVs before running Stage 2 ML models."
-        )
-
-    df = pd.read_csv(csv_path, index_col="Date", parse_dates=["Date"]).sort_index()
-    df = df.loc[df.index.notna()].copy()
-
-    required_cols = [
-        "Actual_Price",
-        "Log_Return",
-        "driver_1_name",
-        "driver_2_name",
-        "driver_3_name",
-    ]
-    missing = [col for col in required_cols if col not in df.columns]
-    if missing:
-        raise KeyError(f"Missing required master CSV columns for {currency}: {missing}")
-
-    return df
-
-
-def _active_feature_names(
-    df: pd.DataFrame,
-    current_date: pd.Timestamp,
-    feature_suffix: str,
-) -> tuple[list[str], list[str]]:
-    """Return human-readable driver names and the aligned feature columns for this date."""
-    top_names = [
-        df.at[current_date, "driver_1_name"],
-        df.at[current_date, "driver_2_name"],
-        df.at[current_date, "driver_3_name"],
-    ]
-
-    active_names: list[str] = []
-    active_cols: list[str] = []
-    for name in top_names:
-        if pd.isna(name):
-            continue
-        feature_col = f"{_sanitize_column_name(str(name))}_{feature_suffix}"
-        if feature_col in df.columns and pd.notna(df.at[current_date, feature_col]):
-            if feature_col not in active_cols:
-                active_cols.append(feature_col)
-                active_names.append(str(name))
-
-    return active_names, active_cols
 
 
 def _effective_tscv(n_obs: int, requested_splits: int) -> TimeSeriesSplit | None:
@@ -708,14 +607,8 @@ def _build_stacked_inputs(
     window: int,
 ) -> tuple[list[str], pd.DataFrame, dict[str, pd.DataFrame]] | None:
     """Return aligned training and current-step inputs for the stacked ensemble."""
-    top_names = [
-        df.at[current_date, "driver_1_name"],
-        df.at[current_date, "driver_2_name"],
-        df.at[current_date, "driver_3_name"],
-    ]
-
     active_names: list[str] = []
-    for name in top_names:
+    for name in top_driver_names(df=df, current_date=current_date):
         if pd.isna(name):
             continue
         raw_col = f"{_sanitize_column_name(str(name))}_raw"
@@ -819,7 +712,20 @@ def _tune_stacked_model(
     random_state: int = 42,
     early_stopping_rounds: int = 25,
 ) -> tuple[Dict[str, Any], float]:
-    """Tune stacked base models and the Ridge meta-model."""
+    """Tune the stacked ensemble and its Ridge meta-learner.
+
+    Args:
+        lookback_df: Rolling training window containing the target and both raw
+            and standardized feature sets.
+        active_names: Ordered list of active macro drivers at the evaluation date.
+        cv_splits: Number of time-series cross-validation folds.
+        random_state: Deterministic seed passed to the base learners.
+        early_stopping_rounds: Tree-model early stopping patience.
+
+    Returns:
+        A tuple containing the selected base-model and meta-model parameters plus
+        the out-of-fold RMSE used to score the ensemble.
+    """
     y_train = lookback_df["Log_Return"]
     base_train_map = {
         "elasticnet": lookback_df[_feature_columns_for_names(active_names, "std")],
@@ -864,7 +770,21 @@ def _fit_stacked_models(
     random_state: int = 42,
     early_stopping_rounds: int = 25,
 ) -> Dict[str, Any]:
-    """Fit the stacked ensemble for one walk-forward step."""
+    """Fit the stacked ensemble for one walk-forward evaluation step.
+
+    Args:
+        lookback_df: Rolling estimation window with the target and aligned features.
+        current_inputs: Current-date feature rows for each base learner.
+        active_names: Ordered list of active macro drivers at the evaluation date.
+        params: Tuned parameter dictionary for the base learners and meta-learner.
+        cv_splits: Number of time-series CV folds used to build meta-features.
+        random_state: Deterministic seed passed to the base learners.
+        early_stopping_rounds: Tree-model early stopping patience.
+
+    Returns:
+        A dictionary containing the current prediction, in-sample fitted values,
+        meta-model weights, and validation diagnostics for the ensemble.
+    """
     y_train = lookback_df["Log_Return"]
     base_train_map = {
         "elasticnet": lookback_df[_feature_columns_for_names(active_names, "std")],
@@ -950,7 +870,31 @@ def run_stage2_model(
     start_date: str | pd.Timestamp | None = None,
     random_state: int = 42,
 ) -> pd.DataFrame:
-    """Run one Stage 2 model with walk-forward training and optional tuning."""
+    """Run a walk-forward Stage 2 model for one currency.
+
+    This function re-estimates the selected learner on a rolling window of the
+    currently dominant macro drivers, compounds the predicted log return into a
+    fair-value path, and records the diagnostics required for the audit layer.
+
+    Args:
+        currency: Currency key such as ``"eur"`` or ``"jpy"``.
+        model_name: Stage 2 learner to run, including the stacked ensemble.
+        window: Rolling training-window length in trading days.
+        error_sum_window: EWMA span used to smooth model error diagnostics.
+        z_window: Optional rolling window for signal standardization.
+        recenter_window: Frequency used to recenter the macro anchor price.
+        return_scale: Scaling applied when compounding predicted log returns.
+        cv_splits: Number of time-series CV folds for model tuning.
+        retune_frequency: Frequency at which hyperparameters are retuned.
+        early_stopping_rounds: Tree-model early stopping patience.
+        processed_dir: Directory containing the processed master CSV files.
+        start_date: Optional start-date filter applied to the finished result.
+        random_state: Deterministic seed used by stochastic learners.
+
+    Returns:
+        A date-indexed DataFrame containing fair-value levels, model diagnostics,
+        signals, and attribution data for the requested learner.
+    """
     model_name = model_name.lower()
     if model_name not in MODEL_FEATURE_SUFFIX:
         raise ValueError(f"Unsupported model_name: {model_name}")
@@ -961,7 +905,11 @@ def run_stage2_model(
     if retune_frequency <= 0:
         raise ValueError("retune_frequency must be a positive integer.")
 
-    df = load_master_training_data(currency=currency, processed_dir=processed_dir)
+    df = load_master_training_data(
+        currency=currency,
+        processed_dir=processed_dir,
+        required_cols=("Actual_Price", "Log_Return", "driver_1_name", "driver_2_name", "driver_3_name"),
+    )
     feature_suffix = MODEL_FEATURE_SUFFIX[model_name]
     signal_window = recenter_window if z_window is None else z_window
     if signal_window <= 0:
@@ -1239,7 +1187,16 @@ def run_stage2_model_suite(
     models: Sequence[str] = DEFAULT_MODELS,
     **kwargs,
 ) -> Dict[str, pd.DataFrame]:
-    """Run the requested model suite and return one result DataFrame per model."""
+    """Run the full Stage 2 model suite for one currency.
+
+    Args:
+        currency: Currency key such as ``"eur"`` or ``"jpy"``.
+        models: Ordered collection of model names to evaluate.
+        **kwargs: Additional keyword arguments forwarded to ``run_stage2_model``.
+
+    Returns:
+        A mapping from model name to its walk-forward Stage 2 result DataFrame.
+    """
     outputs: Dict[str, pd.DataFrame] = {}
     for model_name in models:
         outputs[model_name.lower()] = run_stage2_model(
@@ -1256,7 +1213,17 @@ def save_stage2_model_suite(
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     **kwargs,
 ) -> Dict[str, Path]:
-    """Run the model suite and save one CSV per model."""
+    """Persist the Stage 2 model suite outputs for one currency.
+
+    Args:
+        currency: Currency key such as ``"eur"`` or ``"jpy"``.
+        models: Ordered collection of model names to evaluate.
+        output_dir: Root directory used to store model CSV outputs.
+        **kwargs: Additional keyword arguments forwarded to ``run_stage2_model``.
+
+    Returns:
+        A mapping from model name to the saved CSV path on disk.
+    """
     output_path = Path(output_dir) / currency.lower()
     output_path.mkdir(parents=True, exist_ok=True)
 

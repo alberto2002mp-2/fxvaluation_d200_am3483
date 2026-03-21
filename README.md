@@ -1,292 +1,212 @@
-# FX Valuation — Reproducible Stage 1 + Stage 2 Pipeline
+# FX Valuation: Reproducible G10 Fair-Value and ML Audit Pipeline
 
-This repository implements an end-to-end quantitative FX fair-value workflow across G10 currencies:
+This repository implements a full G10 FX research pipeline:
 
-- **Stage 1**: rolling driver discovery (univariate OLS, significance filtering, diversified top-driver selection)
-- **Stage 2**: walk-forward machine-learning fair-value models (OLS, Ridge, Lasso, ElasticNet, SGD, XGBoost, LightGBM, stacked ensemble)
-- **Audit layer**: signal quality, forward-return validation, strategy equity curves, model comparison, and cross-currency summary outputs
+- Stage 1 driver discovery with rolling OLS and diversified top-driver selection
+- Stage 2 machine learning fair-value models across OLS, regularized linear models, gradient boosting, and a stacked ensemble
+- An audit layer that scores signal quality, plots strategy equity curves, aggregates G10 model rankings, and compares the stacked ensemble against the policy agent
 
-The instructions below are designed so a new user can run the project on their own machine and reproduce the outputs in `data/processed/` and `data/audits/`.
+The workflow below is written for a clean machine and is the recommended way to reproduce the final output file:
 
----
+`data/audits/stage2_final_advanced_ml_report.csv`
 
-## 1) Repository layout
+## Repository Layout
 
 ```text
 fxvaluation_d200_am3483/
-├── config.py
-├── requirements.txt
-├── setup_env.ps1
-├── data/
-│   ├── rawdata.xlsx                     # Primary source dataset
-│   ├── processed/                       # Master training CSVs per currency
-│   ├── audits/                          # Main Stage 2 audit outputs
-│   └── audits_test/                     # Test/sandbox audit outputs
-├── notebooks/
-│   ├── explore_dataframes.ipynb
-│   ├── ultimate_dataframes.ipynb
-│   ├── ols_regressions.ipynb
-│   └── fairvalue_ols.ipynb
-└── src/
-    ├── data/                            # Data loading + transformation pipeline
-    ├── rolling_univariate_ols.py        # Stage 1 rolling single-factor regressions
-    ├── diversified_top_drivers_history.py
-    ├── stage2_ml_models.py              # Stage 2 model runner (CLI)
-    ├── stage2_ml_performance_audit.py   # Stage 2 audit runner (CLI)
-    ├── stage2_fair_value_runner.py      # Convenience fair-value runner
-    └── stage2_policy_agent.py           # Prototype RL threshold policy agent
+|-- config.py
+|-- requirements.txt
+|-- setup_env.ps1
+|-- data/
+|   |-- rawdata.xlsx
+|   |-- processed/
+|   |-- audits/
+|   `-- audits_test/
+|-- notebooks/
+`-- src/
+    |-- data/
+    |-- stage2_ml_models.py
+    |-- stage2_ml_performance_audit.py
+    |-- stage2_policy_agent.py
+    `-- ...
 ```
 
----
+## Supported Environment
 
-## 2) System requirements
+- Python 3.10 or newer
+- Windows, Linux, or macOS
+- 8 GB RAM minimum, 16 GB recommended for full multi-currency runs
 
-- **Python**: 3.10+ recommended (3.8+ should work per dependency bounds)
-- **OS**: Linux/macOS/Windows
-- **RAM**: 8 GB minimum, 16 GB recommended for full multi-model + multi-currency runs
-- **Disk**: 2+ GB free space for outputs/plots
+The repository is pinned to the package versions currently used in the production environment:
 
-Python dependencies are pinned by lower bounds in `requirements.txt` and include:
-`pandas`, `numpy`, `statsmodels`, `scikit-learn`, `xgboost`, `lightgbm`, `matplotlib`, `seaborn`, `plotly`, `openpyxl`, `jupyter`.
+```text
+pandas==3.0.1
+numpy==2.4.2
+scikit-learn==1.8.0
+matplotlib==3.10.8
+seaborn==0.13.2
+plotly==6.6.0
+statsmodels==0.14.6
+xgboost==3.2.0
+lightgbm==4.6.0
+openpyxl==3.1.5
+ipykernel==7.2.0
+jupyter==1.1.1
+```
 
----
+## 1. Clone The Repository
 
-## 3) Environment setup
+```bash
+gh repo clone alberto2002mp-2/fxvaluation_d200_am3483
+cd fxvaluation_d200_am3483
+```
 
-### Option A (Windows PowerShell, automated)
+## 2. Create And Activate A Virtual Environment
+
+### Windows PowerShell
 
 ```powershell
-# From repo root
 .\setup_env.ps1
-```
-
-### Option B (cross-platform, manual)
-
-```bash
-# From repo root
-python -m venv .venv
-
-# Activate
-# Linux/macOS
-source .venv/bin/activate
-# Windows (PowerShell)
 .\.venv\Scripts\Activate.ps1
+```
 
+### Linux or macOS
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### Verify installation
+## 3. Confirm The Source Data Exists
+
+The pipeline expects the Excel workbook at `data/rawdata.xlsx`.
 
 ```bash
-python -c "import pandas, numpy, sklearn, statsmodels, xgboost, lightgbm, plotly; print('env-ok')"
+python -c "from pathlib import Path; p = Path('data/rawdata.xlsx'); print(p.resolve()); print('exists=', p.exists())"
 ```
 
----
+Expected result: the resolved path prints and `exists= True`.
 
-## 4) Data expectations and reproducibility assumptions
+## 4. Build The Master Training CSVs
 
-1. `data/rawdata.xlsx` must exist and be readable (it is the raw source used by the loaders).
-2. The project builds many objects at import time; always run commands from **repo root**.
-3. Some model classes are deterministic by construction, while tree/ensemble methods may show minor run-to-run drift from backend threading/library differences.
-4. To maximize reproducibility across machines, keep:
-    - same Python/dependency versions,
-    - same input Excel file,
-    - same command parameters,
-    - same timezone/locale defaults where possible.
-
----
-
-## 5) Full runbook to replicate results
-
-## Step 0 — Sanity-check the source file
-
-```bash
-python -c "from pathlib import Path; p=Path('data/rawdata.xlsx'); print(p.resolve(), p.exists())"
-```
-
-Expected: path printed with `True`.
-
-## Step 1 — Build master training CSVs (Stage 0/1 preparation)
-
-This creates one file per currency in `data/processed/` (e.g., `eur_master.csv`, `jpy_master.csv`).
+This produces one processed master table per currency in `data/processed/`.
 
 ```bash
 python -m src.data.build_model_ready_data
 ```
 
-Optional custom parameters:
+Expected files include:
+
+- `data/processed/eur_master.csv`
+- `data/processed/gbp_master.csv`
+- `data/processed/aud_master.csv`
+- `data/processed/nzd_master.csv`
+- `data/processed/cad_master.csv`
+- `data/processed/jpy_master.csv`
+- `data/processed/chf_master.csv`
+- `data/processed/nok_master.csv`
+- `data/processed/sek_master.csv`
+
+## 5. Run The Stage 2 Model Suite For One Currency
+
+This generates walk-forward model outputs in `data/model_outputs/<currency>/`.
 
 ```bash
-python - <<'PY'
-from src.data.build_model_ready_data import save_master_training_csvs
-save_master_training_csvs(window=250, min_significance=95.0, top_n=3)
-print('master-csvs-built')
-PY
+python -m src.stage2_ml_models eur --models ols ridge lasso elasticnet sgd xgb lgbm stacked --window 250 --error-sum-window 10 --recenter-window 60 --cv-splits 4 --retune-frequency 60
 ```
 
-## Step 2 — Run Stage 2 model suite for one currency
+## 6. Run The Full Stage 2 Audit For One Currency
 
-Generates per-model output CSVs in `data/model_outputs/<currency>/`.
+This produces the audit datasets, comparison tables, and charts in `data/audits/<currency>/`.
 
 ```bash
-python -m src.stage2_ml_models eur \
-    --models ols ridge lasso elasticnet sgd xgb lgbm stacked \
-    --window 250 \
-    --error-sum-window 10 \
-    --recenter-window 60 \
-    --cv-splits 4 \
-    --retune-frequency 60
+python -m src.stage2_ml_performance_audit eur --compare-models --models ols ridge lasso elasticnet sgd xgb lgbm stacked --window 250 --error-sum-window 10 --recenter-window 60 --forward-days 10 --threshold 2.0
 ```
 
-Repeat for all currencies as needed:
-`eur gbp aud nzd cad jpy chf nok sek`.
+Key files created for one currency include:
 
-## Step 3 — Generate Stage 2 audit for one currency
+- `data/audits/eur/stage2_model_comparison_summary.csv`
+- `data/audits/eur/stage2_stacked_audit_dataset.csv`
+- `data/audits/eur/stage2_policy_agent_dataset.csv` after the G10 comparison step
 
-### 3A) Baseline single-model audit (OLS-focused)
+## 7. Run The Full G10 Package
 
-```bash
-python -m src.stage2_ml_performance_audit eur \
-    --window 50 \
-    --error-sum-window 10 \
-    --recenter-window 60 \
-    --forward-days 10 \
-    --threshold 2.0
-```
+This is the main end-to-end command for reproducing the final report and the G10 comparison package.
 
-### 3B) Multi-model comparison audit
-
-```bash
-python -m src.stage2_ml_performance_audit eur \
-    --compare-models \
-    --models ols ridge lasso elasticnet sgd xgb lgbm stacked \
-    --window 50 \
-    --error-sum-window 10 \
-    --recenter-window 60
-```
-
-Outputs are saved under `data/audits/eur/` (same structure for each currency).
-
-## Step 4 — Replicate full G10 comparison package
-
-This runs the multi-model comparison across all currencies and writes aggregate ranking and SHAP summaries.
-
-```bash
-python - <<'PY'
+```powershell
+@'
 from src.stage2_ml_performance_audit import save_stage2_g10_master_comparison
 
 saved = save_stage2_g10_master_comparison(
-    currencies=("eur","gbp","aud","nzd","cad","jpy","chf","nok","sek"),
-    models=("ols","ridge","lasso","elasticnet","sgd","xgb","lgbm","stacked"),
+    currencies=("eur", "gbp", "aud", "nzd", "cad", "jpy", "chf", "nok", "sek"),
+    models=("ols", "ridge", "lasso", "elasticnet", "sgd", "xgb", "lgbm", "stacked"),
     output_dir="data/audits",
-    window=50,
+    window=250,
     error_sum_window=10,
     recenter_window=60,
     forward_days=10,
     threshold=2.0,
+    cv_splits=4,
+    retune_frequency=60,
+    early_stopping_rounds=25,
 )
 
-for k, v in saved.items():
-    print(f"{k}: {v}")
-PY
+for label, path in saved.items():
+    print(f"{label}: {path}")
+'@ | .\.venv\Scripts\python.exe -
 ```
 
-Key expected aggregate files include:
+The command above will:
+
+1. Build per-currency Stage 2 comparison audits for the full G10 universe.
+2. Save the G10 master ranking table.
+3. Generate deterministic policy-agent outputs from the stacked ensemble audit datasets.
+4. Build the final advanced ML report after the policy-agent comparison exists.
+5. Save G10-average equity-curve and SHAP summary artifacts.
+
+## 8. Final Outputs To Verify
+
+After a successful full run, confirm these files exist:
 
 - `data/audits/stage2_g10_master_model_ranking.csv`
-- `data/audits/stage2_final_advanced_ml_report.csv` (if generated)
-- `data/audits/stage2_g10_shap_driver_summary.csv` (if generated)
-- `data/audits/stage2_g10_shap_theme_summary.csv` (if generated)
+- `data/audits/stage2_final_advanced_ml_report.csv`
 - `data/audits/stage2_policy_vs_stacked_equity_curve.csv`
+- `data/audits/stage2_g10_model_equity_curves.csv`
+- `data/audits/stage2_g10_shap_driver_summary.csv`
+- `data/audits/stage2_g10_shap_theme_summary.csv`
 
----
+Quick validation:
 
-## 6) How to run each major script/module
+```bash
+python -c "from pathlib import Path; required = [Path('data/audits/stage2_g10_master_model_ranking.csv'), Path('data/audits/stage2_final_advanced_ml_report.csv'), Path('data/audits/stage2_policy_vs_stacked_equity_curve.csv')]; print(all(path.exists() for path in required))"
+```
 
-## Data / feature engineering modules
+Expected result: `True`
 
-- `python -m src.data.load_excel_sheets` — parse workbook sheets and print shape/date ranges.
-- `python -m src.data.standardize_rolling_drivers` — build standardized rolling driver map.
-- `python -m src.data.build_model_ready_data` — generate and save currency master CSVs.
+## Optional Notebook Workflow
 
-## Stage 1 driver discovery
+The notebooks are intended for narrative inspection of the same pipeline stages:
 
-- `python -m src.rolling_univariate_ols` — rolling beta/significance maps.
-- `python -m src.top_drivers_history` — top drivers by significance.
-- `python -m src.diversified_top_drivers_history` — category-diversified top drivers.
+1. `notebooks/explore_dataframes.ipynb`
+2. `notebooks/ultimate_dataframes.ipynb`
+3. `notebooks/ols_regressions.ipynb`
+4. `notebooks/fairvalue_ols.ipynb`
 
-## Stage 2 fair value + model outputs
-
-- `python -m src.stage2_ml_models <currency> [options]` — primary model runner CLI.
-- `python -m src.stage2_fair_value_runner` — convenience OLS fair-value run + plot.
-
-## Stage 2 auditing/reporting
-
-- `python -m src.stage2_ml_performance_audit <currency> [options]` — baseline or multi-model audit.
-
-## Notebook workflow (optional)
-
-After environment activation:
+Launch with:
 
 ```bash
 jupyter notebook notebooks/
 ```
 
-Suggested order:
-1. `explore_dataframes.ipynb`
-2. `ultimate_dataframes.ipynb`
-3. `ols_regressions.ipynb`
-4. `fairvalue_ols.ipynb`
+## Troubleshooting
 
----
-
-## 7) Validation checks after a full run
-
-Use these checks to confirm a successful replication:
-
-```bash
-# 1) Processed masters exist
-python -c "from pathlib import Path; req=['eur','gbp','aud','nzd','cad','jpy','chf','nok','sek']; print(all((Path('data/processed')/f'{c}_master.csv').exists() for c in req))"
-
-# 2) One currency audit summary exists
-python -c "from pathlib import Path; print((Path('data/audits/eur/stage2_model_comparison_summary.csv')).exists())"
-
-# 3) G10 aggregate ranking exists
-python -c "from pathlib import Path; print((Path('data/audits/stage2_g10_master_model_ranking.csv')).exists())"
-```
-
----
-
-## 8) Operational best practices (industry standard)
-
-- Run inside a dedicated virtual environment and lock package versions for production replication.
-- Keep raw data immutable (`data/rawdata.xlsx`) and version output artifacts separately.
-- Parameterize all runs (window, threshold, retune frequency) and log them with output paths.
-- Treat `data/audits/` as generated artifacts; avoid manual edits.
-- For team reproducibility, store command history (or a shell script) used to produce each results bundle.
-
----
-
-## 9) Troubleshooting
-
-- **`FileNotFoundError: Could not locate project root containing 'src'`**
-    - Run commands from repo root or use `python -m ...` module form.
-
-- **`rawdata.xlsx does not exist`**
-    - Ensure `data/rawdata.xlsx` is present and readable.
-
-- **LightGBM / XGBoost import issues**
-    - Reinstall dependencies in a clean environment:
-        `pip install --upgrade pip && pip install -r requirements.txt`
-
-- **No signals generated in audit output**
-    - Lower/adjust threshold (`--threshold`), increase sample window, or validate master CSV content.
-
----
+- `FileNotFoundError` for a master CSV usually means `python -m src.data.build_model_ready_data` has not been run yet.
+- `rawdata.xlsx` errors mean `data/rawdata.xlsx` is missing or unreadable.
+- `lightgbm` or `xgboost` import errors usually indicate the active environment is not the project virtual environment.
+- The recommended invocation style is `python -m ...` from repository root. The scripts now use `pathlib` and script-relative path resolution, but running from repo root remains the cleanest operational pattern.
 
 ## License
 
-This project is licensed under the terms in `LICENSE`.
-
-
+This project is licensed under the Apache-2.0 License. See `LICENSE` for the full text.

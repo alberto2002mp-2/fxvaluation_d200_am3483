@@ -1,68 +1,42 @@
-# Data Science Environment Setup Script
-# This script sets up a virtual environment and installs required dependencies
-
-# Enable error handling
 $ErrorActionPreference = "Stop"
 
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Data Science Project Setup" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
+$venvDir = ".venv"
 
-# Check if Python is installed
-Write-Host "Checking if Python is installed..." -ForegroundColor Yellow
-try {
-    $pythonVersion = python --version 2>&1
-    Write-Host "Python found: $pythonVersion" -ForegroundColor Green
-} catch {
-    Write-Host "Python is not installed or not in PATH" -ForegroundColor Red
-    Write-Host "Please install Python from https://www.python.org/" -ForegroundColor Red
-    exit 1
+function Get-PythonCommand {
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        return @("py", "-3")
+    }
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        return @("python")
+    }
+    throw "Python 3 was not found in PATH. Install Python 3.10+ and rerun this script."
 }
 
-Write-Host ""
+$pythonCmd = Get-PythonCommand
+$pythonArgs = if ($pythonCmd.Length -gt 1) { $pythonCmd[1..($pythonCmd.Length - 1)] } else { @() }
+$pythonVersion = & $pythonCmd[0] @pythonArgs --version 2>&1
+$pythonExe = Join-Path $venvDir "Scripts\\python.exe"
 
-# Check if venv already exists
-if (Test-Path "venv") {
-    Write-Host "Virtual environment already exists. Deleting it..." -ForegroundColor Yellow
-    Remove-Item -Recurse -Force "venv"
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "FX Valuation Environment Setup" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Python interpreter: $pythonVersion" -ForegroundColor Green
+
+if (Test-Path $venvDir) {
+    Write-Host "Removing existing $venvDir environment..." -ForegroundColor Yellow
+    Remove-Item -Recurse -Force $venvDir
 }
 
-# Create virtual environment
-Write-Host "Creating virtual environment..." -ForegroundColor Yellow
-python -m venv venv
-Write-Host "Virtual environment created" -ForegroundColor Green
-Write-Host ""
+Write-Host "Creating virtual environment in $venvDir..." -ForegroundColor Yellow
+& $pythonCmd[0] @pythonArgs -m venv $venvDir
 
-# Activate virtual environment
-Write-Host "Activating virtual environment..." -ForegroundColor Yellow
-& ".\venv\Scripts\Activate.ps1"
-Write-Host "Virtual environment activated" -ForegroundColor Green
-Write-Host ""
+Write-Host "Upgrading packaging tools..." -ForegroundColor Yellow
+& $pythonExe -m pip install --upgrade pip setuptools wheel
 
-# Upgrade pip
-Write-Host "Upgrading pip..." -ForegroundColor Yellow
-python -m pip install --upgrade pip setuptools wheel
-Write-Host "pip upgraded" -ForegroundColor Green
-Write-Host ""
+Write-Host "Installing pinned repository requirements..." -ForegroundColor Yellow
+& $pythonExe -m pip install -r requirements.txt
 
-# Install requirements
-Write-Host "Installing requirements from requirements.txt..." -ForegroundColor Yellow
-pip install -r requirements.txt
-Write-Host "All requirements installed" -ForegroundColor Green
-Write-Host ""
-
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Setup Complete!" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Your virtual environment is now active!" -ForegroundColor Green
-Write-Host ""
-Write-Host "Project structure:" -ForegroundColor Yellow
-Write-Host "  data/         - Store your datasets here" -ForegroundColor White
-Write-Host "  notebooks/    - Jupyter notebooks for exploration and analysis" -ForegroundColor White
-Write-Host "  src/          - Python modules and utilities" -ForegroundColor White
-Write-Host ""
-Write-Host "To deactivate the environment in the future, run:" -ForegroundColor Yellow
-Write-Host "  deactivate" -ForegroundColor White
-Write-Host ""
+Write-Host "" 
+Write-Host "Environment ready." -ForegroundColor Green
+Write-Host "Activate with:" -ForegroundColor Yellow
+Write-Host "  .\\.venv\\Scripts\\Activate.ps1" -ForegroundColor White

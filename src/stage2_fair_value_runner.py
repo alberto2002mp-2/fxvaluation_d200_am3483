@@ -8,43 +8,12 @@ import sys
 import numpy as np
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-cwd = Path.cwd()
-if (cwd / "src").exists():
-    project_root = cwd
-elif (cwd.parent / "src").exists():
-    project_root = cwd.parent
-else:
-    raise FileNotFoundError("Could not locate project root containing 'src'.")
-
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from src.data.build_model_ready_data import DEFAULT_PROCESSED_DIR
+from src.stage2_common import DEFAULT_PROCESSED_DIR, compute_days_in_signal as _compute_days_in_signal
 from src.stage2_ml_models import run_stage2_model
-
-
-def _compute_days_in_signal(error_z: pd.Series, threshold: float = 2.0) -> pd.Series:
-    """Count consecutive days where z-score stays above +threshold or below -threshold."""
-    regime = pd.Series(0, index=error_z.index, dtype=int)
-    regime = regime.where(~(error_z > threshold), 1)
-    regime = regime.where(~(error_z < -threshold), -1)
-
-    days = pd.Series(0, index=error_z.index, dtype=int)
-    run = 0
-    prev_regime = 0
-    for dt, current_regime in regime.items():
-        if current_regime == 0:
-            run = 0
-            prev_regime = 0
-        elif current_regime == prev_regime:
-            run += 1
-        else:
-            run = 1
-            prev_regime = current_regime
-        days.at[dt] = run
-
-    return days
 
 
 def plot_stage2_fair_value_plotly(

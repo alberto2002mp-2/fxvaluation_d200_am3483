@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import re
-import sys
 from typing import Any, Dict, Sequence
 
 import matplotlib.pyplot as plt
@@ -14,63 +12,18 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
-
-cwd = Path.cwd()
-if (cwd / "src").exists():
-    project_root = cwd
-elif (cwd.parent / "src").exists():
-    project_root = cwd.parent
-else:
-    raise FileNotFoundError("Could not locate project root containing 'src'.")
-
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-
-DEFAULT_PROCESSED_DIR = project_root / "data" / "processed"
-DEFAULT_AUDIT_DIR = project_root / "data" / "audits"
-DEFAULT_CURRENCIES = ("eur", "gbp", "aud", "nzd", "cad", "jpy", "chf", "nok", "sek")
-
-
 from src.stage2_ml_models import DEFAULT_MODELS, MODEL_LABELS, run_stage2_model_suite
+from src.stage2_common import (
+    DEFAULT_AUDIT_DIR,
+    DEFAULT_CURRENCIES,
+    DEFAULT_PROCESSED_DIR,
+    active_feature_names as _active_feature_names,
+    adjusted_r2 as _adjusted_r2,
+    compute_days_in_signal as _compute_days_in_signal,
+    load_model_ready_data as _get_model_ready_data,
+    rmse as _rmse,
+)
 from src.stage2_policy_agent import PolicyAgent
-
-
-def _sanitize_column_name(name: str) -> str:
-    """Convert a human-readable driver name into the saved snake_case form."""
-    clean = re.sub(r"[^0-9a-zA-Z]+", "_", name.strip())
-    clean = re.sub(r"_+", "_", clean).strip("_")
-    return clean.lower()
-
-
-def _compute_days_in_signal(error_z: pd.Series, threshold: float = 2.0) -> pd.Series:
-    """Count consecutive days where z-score stays above +threshold or below -threshold."""
-    regime = pd.Series(0, index=error_z.index, dtype=int)
-    regime = regime.where(~(error_z > threshold), 1)
-    regime = regime.where(~(error_z < -threshold), -1)
-
-    days = pd.Series(0, index=error_z.index, dtype=int)
-    run = 0
-    prev_regime = 0
-    for dt, current_regime in regime.items():
-        if current_regime == 0:
-            run = 0
-            prev_regime = 0
-        elif current_regime == prev_regime:
-            run += 1
-        else:
-            run = 1
-            prev_regime = current_regime
-        days.at[dt] = run
-
-    return days
-
-
-def _adjusted_r2(r2: float, n_obs: int, n_features: int) -> float:
-    """Return adjusted R^2, or NaN when undefined."""
-    if n_obs <= n_features + 1:
-        return np.nan
-    return 1 - (1 - r2) * ((n_obs - 1) / (n_obs - n_features - 1))
 
 
 def _max_drawdown(equity_curve: pd.Series) -> float:
@@ -95,11 +48,6 @@ def _annualized_sharpe_ratio(daily_returns: pd.Series, periods_per_year: int = 2
 
     mean_return = float(clean.mean())
     return mean_return / volatility * np.sqrt(periods_per_year)
-
-
-def _rmse(y_true: pd.Series | np.ndarray, y_pred: pd.Series | np.ndarray) -> float:
-    """Return root mean squared error."""
-    return float(np.sqrt(np.mean(np.square(np.asarray(y_true) - np.asarray(y_pred)))))
 
 
 def _largest_beta_driver(row: pd.Series) -> pd.Series:
@@ -175,49 +123,6 @@ def _largest_model_attribution(row: pd.Series) -> pd.Series:
         }
     )
 
-
-def _get_model_ready_data(
-    currency: str,
-    processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
-) -> pd.DataFrame:
-    """Load the saved master CSV and return the raw-feature Stage 2 inputs."""
-    csv_path = Path(processed_dir) / f"{currency.lower()}_master.csv"
-    if not csv_path.exists():
-        raise FileNotFoundError(
-            f"{csv_path} does not exist. Build the master CSVs before running the audit."
-        )
-
-    df = pd.read_csv(csv_path, index_col="Date", parse_dates=["Date"]).sort_index()
-    df = df.loc[df.index.notna()].copy()
-
-    required_cols = ["Actual_Price", "Log_Return"]
-    missing = [col for col in required_cols if col not in df.columns]
-    if missing:
-        raise KeyError(f"Missing required master CSV columns for {currency}: {missing}")
-
-    feature_cols = [col for col in df.columns if col.endswith("_raw")]
-    out = df.loc[:, required_cols + feature_cols].copy()
-
-    top_aliases = {
-        "driver_1_name": ["driver_1_name", "Driver 1 Name"],
-        "driver_2_name": ["driver_2_name", "Driver 2 Name"],
-        "driver_3_name": ["driver_3_name", "Driver 3 Name"],
-        "driver_1_beta_z": ["driver_1_beta_z", "Driver 1 Beta Z"],
-        "driver_2_beta_z": ["driver_2_beta_z", "Driver 2 Beta Z"],
-        "driver_3_beta_z": ["driver_3_beta_z", "Driver 3 Beta Z"],
-        "driver_1_normal_beta": ["driver_1_normal_beta", "Driver 1 Normal Beta"],
-        "driver_2_normal_beta": ["driver_2_normal_beta", "Driver 2 Normal Beta"],
-        "driver_3_normal_beta": ["driver_3_normal_beta", "Driver 3 Normal Beta"],
-    }
-    for alias_col, stored_candidates in top_aliases.items():
-        for stored_col in stored_candidates:
-            if stored_col in df.columns:
-                out[alias_col] = df[stored_col]
-                break
-
-    return out
-
-
 def build_stage2_audit_dataset(
     currency: str,
     window: int = 50,
@@ -231,13 +136,34 @@ def build_stage2_audit_dataset(
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
     start_date: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    """
-    Rebuild the Stage 2 rolling model and return a signal-level audit dataset.
+    """Rebuild the baseline Stage 2 OLS audit dataset for one currency.
 
-    The signal trigger is defined as the first day in a BUY/SELL regime
-    (`Days_In_Signal == 1`). This avoids double-counting multi-day signal runs.
+    The baseline audit uses a rolling linear fair-value model to translate the
+    current top-driver set into a valuation gap, then evaluates whether the
+    first day of each BUY or SELL regime predicts forward returns.
+
+    Args:
+        currency: Currency key such as ``"eur"`` or ``"jpy"``.
+        window: Rolling training-window length in trading days.
+        error_sum_window: EWMA span used to smooth cumulative error.
+        z_window: Optional rolling window used to standardize the valuation gap.
+        recenter_window: Frequency used to recenter the macro anchor price.
+        forward_days: Forward return horizon used for hit-rate evaluation.
+        threshold: Absolute z-score threshold used for BUY and SELL triggers.
+        return_scale: Scaling applied when compounding predicted log returns.
+        sharpe_window: Rolling window length for the strategy Sharpe series.
+        processed_dir: Directory containing the processed master CSV files.
+        start_date: Optional start-date filter applied to the finished audit.
+
+    Returns:
+        A date-indexed audit DataFrame containing model diagnostics, signals,
+        forward returns, and strategy metrics.
     """
-    df = _get_model_ready_data(currency=currency, processed_dir=processed_dir).copy()
+    df = _get_model_ready_data(
+        currency=currency,
+        processed_dir=processed_dir,
+        feature_suffix="raw",
+    ).copy()
     df = df.sort_index()
 
     required_cols = [
@@ -266,22 +192,11 @@ def build_stage2_audit_dataset(
 
     for i in range(window, len(df)):
         current_date = df.index[i]
-        top_names = [
-            df.at[current_date, "driver_1_name"],
-            df.at[current_date, "driver_2_name"],
-            df.at[current_date, "driver_3_name"],
-        ]
-
-        active_driver_names = []
-        active_driver_cols = []
-        for name in top_names:
-            if pd.isna(name):
-                continue
-            raw_col = f"{_sanitize_column_name(str(name))}_raw"
-            if raw_col in df.columns and pd.notna(df.at[current_date, raw_col]):
-                if raw_col not in active_driver_cols:
-                    active_driver_cols.append(raw_col)
-                    active_driver_names.append(str(name))
+        active_driver_names, active_driver_cols = _active_feature_names(
+            df=df,
+            current_date=current_date,
+            feature_suffix="raw",
+        )
 
         if not active_driver_cols:
             continue
@@ -601,7 +516,18 @@ def prepare_stage2_strategy_audit(
     threshold: float = 2.0,
     sharpe_window: int = 252,
 ) -> pd.DataFrame:
-    """Add strategy and audit fields to an existing Stage 2 result frame."""
+    """Augment a Stage 2 result set with strategy and audit diagnostics.
+
+    Args:
+        stage2_df: Output from a Stage 2 model containing fair-value diagnostics.
+        forward_days: Forward return horizon used for hit-rate evaluation.
+        threshold: Absolute z-score threshold used for BUY and SELL triggers.
+        sharpe_window: Rolling window length for the strategy Sharpe series.
+
+    Returns:
+        A DataFrame with trading signals, hit flags, equity-curve statistics,
+        and interpretability fields required by the audit layer.
+    """
     audit_df = stage2_df.copy().sort_index()
 
     if "Signal_Z" not in audit_df.columns and "Error_Z" in audit_df.columns:
@@ -869,7 +795,29 @@ def build_stage2_model_comparison_audit(
     processed_dir: str | Path = DEFAULT_PROCESSED_DIR,
     start_date: str | pd.Timestamp | None = None,
 ) -> Dict[str, Any]:
-    """Run the full model suite and build the requested comparison audit."""
+    """Run the multi-model Stage 2 audit for one currency.
+
+    Args:
+        currency: Currency key such as ``"eur"`` or ``"jpy"``.
+        models: Ordered collection of model names to evaluate.
+        window: Rolling training-window length in trading days.
+        error_sum_window: EWMA span used to smooth cumulative error.
+        z_window: Optional rolling window used to standardize the valuation gap.
+        recenter_window: Frequency used to recenter the macro anchor price.
+        forward_days: Forward return horizon used for hit-rate evaluation.
+        threshold: Absolute z-score threshold used for BUY and SELL triggers.
+        return_scale: Scaling applied when compounding predicted log returns.
+        sharpe_window: Rolling window length for the strategy Sharpe series.
+        cv_splits: Number of time-series CV folds for model tuning.
+        retune_frequency: Frequency at which hyperparameters are retuned.
+        early_stopping_rounds: Tree-model early stopping patience.
+        processed_dir: Directory containing the processed master CSV files.
+        start_date: Optional start-date filter applied to each model output.
+
+    Returns:
+        A dictionary containing the per-model audit datasets, the comparison
+        summary table, and the combined interpretability-hit table.
+    """
     stage2_results = run_stage2_model_suite(
         currency=currency,
         models=models,
@@ -926,7 +874,18 @@ def save_stage2_model_comparison_audit(
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
     **kwargs,
 ) -> Dict[str, Path]:
-    """Save the multi-model comparison audit outputs to disk."""
+    """Persist the multi-model Stage 2 audit outputs for one currency.
+
+    Args:
+        currency: Currency key such as ``"eur"`` or ``"jpy"``.
+        models: Ordered collection of model names to evaluate.
+        output_dir: Root directory used to store audit artifacts.
+        **kwargs: Additional keyword arguments forwarded to
+            ``build_stage2_model_comparison_audit``.
+
+    Returns:
+        A mapping from artifact label to its saved path on disk.
+    """
     audit = build_stage2_model_comparison_audit(
         currency=currency,
         models=models,
@@ -1008,7 +967,16 @@ def build_g10_shap_summary(
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
     models: Sequence[str] = ("xgb", "lgbm"),
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Aggregate SHAP contributions across the G10 universe."""
+    """Aggregate tree-model SHAP contributions across the G10 universe.
+
+    Args:
+        currencies: Currency keys to include in the cross-sectional summary.
+        output_dir: Root directory containing the per-currency audit datasets.
+        models: Tree-based model names whose SHAP contributions should be pooled.
+
+    Returns:
+        A tuple of ``(driver_summary, theme_summary)`` DataFrames.
+    """
     rows: list[Dict[str, Any]] = []
     for currency in currencies:
         currency_dir = Path(output_dir) / currency.lower()
@@ -1087,7 +1055,16 @@ def build_final_advanced_ml_report(
     currencies: Sequence[str] = DEFAULT_CURRENCIES,
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
 ) -> pd.DataFrame:
-    """Build the final thesis-facing 8-model ranking report."""
+    """Build the final G10 ranking report used in the thesis-style summary.
+
+    Args:
+        master_table: G10 master comparison table built from per-currency audits.
+        currencies: Currency keys used when appending the policy-agent summary.
+        output_dir: Root directory containing the saved audit artifacts.
+
+    Returns:
+        A ranked final report combining the model families and the policy agent.
+    """
     report = master_table.copy()
     policy_summary = build_policy_agent_summary(currencies=currencies, output_dir=output_dir)
     if not policy_summary.empty:
@@ -1106,7 +1083,7 @@ def build_final_advanced_ml_report(
     }
 
     report["IC_Rank"] = report["Average_Information_Coefficient"].rank(
-        ascending=True,
+        ascending=False,
         method="dense",
         na_option="bottom",
     )
@@ -1118,7 +1095,7 @@ def build_final_advanced_ml_report(
     report["Combined_Rank"] = (report["IC_Rank"] + report["Hit_Rank"]) / 2.0
     report = report.sort_values(
         by=["Combined_Rank", "Average_Information_Coefficient", "Average_Hit_Rate_Pct"],
-        ascending=[True, True, False],
+        ascending=[True, False, False],
     ).reset_index(drop=True)
     report.insert(0, "Model_Family", report["Model"].map(family_map).fillna("Other"))
     report.insert(0, "Final_Rank", np.arange(1, len(report) + 1))
@@ -1130,7 +1107,16 @@ def save_policy_agent_comparison(
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
     agent_epochs: int = 8,
 ) -> Dict[str, Path]:
-    """Run the prototype PolicyAgent on the stacked audit datasets and save a comparison plot."""
+    """Run the policy agent on stacked-audit datasets and save G10 comparisons.
+
+    Args:
+        currencies: Currency keys to include in the policy overlay.
+        output_dir: Root directory containing the stacked audit datasets.
+        agent_epochs: Number of Q-learning passes through each currency dataset.
+
+    Returns:
+        A mapping from artifact label to its saved comparison path on disk.
+    """
     root = Path(output_dir)
     stacked_curves = []
     policy_curves = []
@@ -1142,7 +1128,7 @@ def save_policy_agent_comparison(
             continue
 
         stacked_df = pd.read_csv(stacked_path, index_col="Date", parse_dates=["Date"])
-        agent = PolicyAgent(epsilon=0.05)
+        agent = PolicyAgent(epsilon=0.05, random_state=42)
         policy_df = agent.train(stacked_df, epochs=agent_epochs)
 
         policy_path = currency_dir / "stage2_policy_agent_dataset.csv"
@@ -1167,7 +1153,7 @@ def save_policy_agent_comparison(
             "StackedEnsemble_G10": stacked_panel.mean(axis=1, skipna=True),
             "PolicyAgent_G10": policy_panel.mean(axis=1, skipna=True),
         }
-    ).dropna(how="all")
+    ).dropna(how="any")
 
     comparison_path = root / "stage2_policy_vs_stacked_equity_curve.csv"
     comparison.to_csv(comparison_path, index=True)
@@ -1195,7 +1181,15 @@ def build_policy_agent_summary(
     currencies: Sequence[str] = DEFAULT_CURRENCIES,
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
 ) -> pd.DataFrame:
-    """Aggregate PolicyAgent performance across currencies for the final report."""
+    """Aggregate policy-agent performance across currencies.
+
+    Args:
+        currencies: Currency keys to include in the policy summary.
+        output_dir: Root directory containing the policy and stacked audit files.
+
+    Returns:
+        A one-row DataFrame summarizing the average G10 policy-agent performance.
+    """
     rows: list[Dict[str, Any]] = []
     root = Path(output_dir)
 
@@ -1268,7 +1262,16 @@ def save_g10_average_model_equity_curves(
     models: Sequence[str] = DEFAULT_MODELS,
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
 ) -> Dict[str, Path]:
-    """Save a G10-average multi-model equity-curve chart, including PolicyAgent."""
+    """Save G10-average equity curves for all audited model families.
+
+    Args:
+        currencies: Currency keys to include in the cross-sectional averages.
+        models: Model names whose audit datasets should be aggregated.
+        output_dir: Root directory containing the per-currency audit outputs.
+
+    Returns:
+        A mapping from artifact label to the saved CSV and PNG paths.
+    """
     root = Path(output_dir)
     average_curves: Dict[str, pd.Series] = {}
 
@@ -1336,7 +1339,14 @@ def save_g10_average_model_equity_curves(
 def build_g10_master_comparison_table(
     comparison_summaries: Sequence[pd.DataFrame],
 ) -> pd.DataFrame:
-    """Aggregate per-currency comparison summaries into one master ranking table."""
+    """Aggregate per-currency comparison summaries into a G10 master table.
+
+    Args:
+        comparison_summaries: Per-currency model comparison summary DataFrames.
+
+    Returns:
+        A G10 master comparison table with averaged performance metrics and ranks.
+    """
     combined = pd.concat(comparison_summaries, axis=0, ignore_index=True)
     for column in ("Average_Adj_R2", "Average_Rolling_RMSE", "Average_Strategy_Total_Return_Pct"):
         if column not in combined.columns:
@@ -1378,7 +1388,17 @@ def save_stage2_g10_master_comparison(
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
     **kwargs,
 ) -> Dict[str, Path]:
-    """Run and save the comparison audit for the full currency universe plus a master table."""
+    """Run the end-to-end G10 comparison package and persist all aggregate outputs.
+
+    Args:
+        currencies: Currency keys to include in the full G10 package.
+        models: Model names to evaluate for each currency.
+        output_dir: Root directory used to store aggregate audit artifacts.
+        **kwargs: Additional keyword arguments forwarded to the per-currency audit.
+
+    Returns:
+        A mapping from artifact label to the saved path on disk.
+    """
     comparison_summaries: list[pd.DataFrame] = []
 
     for currency in currencies:
@@ -1394,6 +1414,10 @@ def save_stage2_g10_master_comparison(
     master_table = build_g10_master_comparison_table(comparison_summaries)
     master_path = Path(output_dir) / "stage2_g10_master_model_ranking.csv"
     master_table.to_csv(master_path, index=False)
+
+    saved = {"master_ranking_csv": master_path}
+    saved.update(save_policy_agent_comparison(currencies=currencies, output_dir=output_dir))
+
     final_report = build_final_advanced_ml_report(
         master_table,
         currencies=currencies,
@@ -1415,14 +1439,12 @@ def save_stage2_g10_master_comparison(
         shap_theme_summary.to_csv(shap_theme_path, index=False)
         _plot_g10_shap_summary(shap_driver_summary, shap_plot_path)
 
-    saved = {"master_ranking_csv": master_path}
     if not final_report.empty:
         saved["final_advanced_report_csv"] = final_report_path
     if not shap_driver_summary.empty:
         saved["g10_shap_driver_summary_csv"] = shap_driver_path
         saved["g10_shap_theme_summary_csv"] = shap_theme_path
         saved["g10_shap_summary_png"] = shap_plot_path
-    saved.update(save_policy_agent_comparison(currencies=currencies, output_dir=output_dir))
     saved.update(
         save_g10_average_model_equity_curves(
             currencies=currencies,
@@ -1438,7 +1460,17 @@ def save_stage2_ml_performance_audit(
     output_dir: str | Path = DEFAULT_AUDIT_DIR,
     **kwargs,
 ) -> Dict[str, Path]:
-    """Generate the audit and save CSV/PNG outputs to disk."""
+    """Persist the baseline Stage 2 audit outputs for one currency.
+
+    Args:
+        currency: Currency key such as ``"eur"`` or ``"jpy"``.
+        output_dir: Root directory used to store audit artifacts.
+        **kwargs: Additional keyword arguments forwarded to
+            ``build_stage2_ml_performance_audit``.
+
+    Returns:
+        A mapping from artifact label to its saved path on disk.
+    """
     audit = build_stage2_ml_performance_audit(currency=currency, **kwargs)
 
     currency_dir = Path(output_dir) / currency.lower()
