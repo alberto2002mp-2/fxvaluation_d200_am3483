@@ -63,18 +63,20 @@ cd fxvaluation_d200_am3483
 
 ## 2. Create And Activate A Virtual Environment
 
+Earlier revisions of this repository referenced `.venv`. That was only a directory-naming inconsistency, not a separate environment type. The project now uses `venv` consistently.
+
 ### Windows PowerShell
 
 ```powershell
 .\setup_env.ps1
-.\.venv\Scripts\Activate.ps1
+.\venv\Scripts\Activate.ps1
 ```
 
 ### Linux or macOS
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
 ```
@@ -155,7 +157,7 @@ saved = save_stage2_g10_master_comparison(
 
 for label, path in saved.items():
     print(f"{label}: {path}")
-'@ | .\.venv\Scripts\python.exe -
+'@ | .\venv\Scripts\python.exe -
 ```
 
 The command above will:

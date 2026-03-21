@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$venvDir = ".venv"
+$venvDir = "venv"
 
 function Get-PythonCommand {
     if (Get-Command py -ErrorAction SilentlyContinue) {
@@ -39,4 +39,4 @@ Write-Host "Installing pinned repository requirements..." -ForegroundColor Yello
 Write-Host "" 
 Write-Host "Environment ready." -ForegroundColor Green
 Write-Host "Activate with:" -ForegroundColor Yellow
-Write-Host "  .\\.venv\\Scripts\\Activate.ps1" -ForegroundColor White
+Write-Host "  .\\venv\\Scripts\\Activate.ps1" -ForegroundColor White
