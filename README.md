@@ -4,7 +4,7 @@ This repository implements a full G10 FX research pipeline:
 
 - Stage 1 driver discovery with rolling OLS and diversified top-driver selection
 - Stage 2 machine learning fair-value models across OLS, regularized linear models, gradient boosting, and a stacked ensemble
-- An audit layer that scores signal quality, plots strategy equity curves, aggregates G10 model rankings, and compares the stacked ensemble against the policy agent
+- An audit layer that scores signal quality, plots strategy equity curves, aggregates G10 model rankings, and compares the stacked ensemble against the reinforcement learning policy agent
 
 The workflow below is written for a clean machine and is the recommended way to reproduce the final output file:
 
