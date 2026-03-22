@@ -63,7 +63,6 @@ cd fxvaluation_d200_am3483
 
 ## 2. Create And Activate A Virtual Environment
 
-Earlier revisions of this repository referenced `.venv`. That was only a directory-naming inconsistency, not a separate environment type. The project now uses `venv` consistently.
 
 ### Windows PowerShell
 
